@@ -203,6 +203,146 @@ class WorkflowHTTPTests(unittest.TestCase):
         self.assertEqual(switched["provider"], "custom")
         self.assertEqual(switched["protocol"], "chat_completions")
 
+    def test_multiple_generator_profiles_keep_keys_out_of_storage_and_responses(self):
+        profiles = [
+            {
+                "id": "qwen-cheap", "name": "千问低成本", "provider": "qwen",
+                "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                "protocol": "chat_completions", "model": "qwen-plus",
+            },
+            {
+                "id": "deepseek-backup", "name": "DeepSeek 备用", "provider": "deepseek",
+                "base_url": "https://api.deepseek.com",
+                "protocol": "chat_completions", "model": "deepseek-chat",
+            },
+        ]
+        status, settings = self.request("/api/generator/settings", {
+            "profiles": profiles,
+            "auto_fallback": True,
+            "api_key_profile_id": "qwen-cheap",
+            "api_key": "test-only-profile-key",
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual([item["id"] for item in settings["profiles"]], ["qwen-cheap", "deepseek-backup"])
+        self.assertTrue(settings["profiles"][0]["key_in_memory"])
+        self.assertFalse(settings["profiles"][1]["key_in_memory"])
+        self.assertTrue(settings["auto_fallback"])
+        self.assertNotIn("api_key", json.dumps(settings))
+
+        _, bootstrap = self.request("/api/bootstrap")
+        saved = Repository(self.data_dir).get_settings()
+        self.assertNotIn("test-only-profile-key", json.dumps(bootstrap))
+        self.assertNotIn("test-only-profile-key", saved["generator_profiles_json"])
+
+        status, keyed_backup = self.request("/api/generator/settings", {
+            "profiles": profiles,
+            "auto_fallback": True,
+            "api_key_profile_id": "deepseek-backup",
+            "api_key": "test-only-backup-key",
+        })
+        self.assertEqual(status, 200)
+        self.assertTrue(keyed_backup["profiles"][0]["key_in_memory"])
+        self.assertTrue(keyed_backup["profiles"][1]["key_in_memory"])
+
+        changed_profiles = [dict(profile) for profile in profiles]
+        changed_profiles[0]["base_url"] = "https://custom-qwen-relay.example/v1"
+        status, changed_endpoint = self.request("/api/generator/settings", {
+            "profiles": changed_profiles,
+            "auto_fallback": True,
+            "api_key_profile_id": "deepseek-backup",
+        })
+        self.assertEqual(status, 200)
+        self.assertFalse(changed_endpoint["profiles"][0]["key_in_memory"])
+        self.assertTrue(changed_endpoint["profiles"][1]["key_in_memory"])
+
+        reordered = list(reversed(profiles))
+        status, changed = self.request("/api/generator/settings", {
+            "profiles": reordered, "auto_fallback": False,
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(changed["profiles"][0]["id"], "deepseek-backup")
+        self.assertFalse(changed["auto_fallback"])
+
+        status, deleted = self.request("/api/generator/settings", {
+            "profiles": [], "auto_fallback": True,
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(deleted["profiles"], [])
+        saved = Repository(self.data_dir).get_settings()
+        self.assertEqual(saved["generator_profiles_json"], "[]")
+        self.assertEqual(saved["generator_model"], "")
+
+        script = (
+            "import json, os; from app import _load_generator_profiles; "
+            "from workbench.store import Repository; "
+            "settings = Repository(os.environ['XHS_WORKBENCH_DATA_DIR']).get_settings(); "
+            "print(len(_load_generator_profiles(settings)))"
+        )
+        env = dict(os.environ)
+        env["XHS_WORKBENCH_DATA_DIR"] = str(self.data_dir)
+        env["XHS_LLM_MODEL"] = "stale-legacy-model"
+        env["XHS_LLM_API_KEY"] = "test-only-legacy-key"
+        restarted = subprocess.run(
+            [sys.executable, "-c", script], cwd=str(ROOT), env=env,
+            text=True, capture_output=True, timeout=10, check=True,
+        )
+        self.assertEqual(restarted.stdout.strip(), "0")
+
+    def test_legacy_environment_key_requires_exact_model_and_endpoint_match(self):
+        profile = {
+            "id": "qwen", "name": "通义", "provider": "qwen",
+            "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "protocol": "chat_completions", "model": "shared-model-name",
+        }
+        script = (
+            "import json, os; from app import _load_generator_profiles; "
+            "profiles = _load_generator_profiles(json.loads(os.environ['TEST_SETTINGS'])); "
+            "print(json.dumps([bool(item['api_key']) for item in profiles]))"
+        )
+        env = dict(os.environ)
+        env["XHS_WORKBENCH_DATA_DIR"] = str(self.data_dir)
+        env["XHS_LLM_MODEL"] = "shared-model-name"
+        env["XHS_LLM_BASE_URL"] = "https://api.openai.com/v1"
+        env["XHS_LLM_API_KEY"] = "test-only-env-key"
+        env["TEST_SETTINGS"] = json.dumps({"generator_profiles_json": json.dumps([profile])})
+        mismatched = subprocess.run(
+            [sys.executable, "-c", script], cwd=str(ROOT), env=env,
+            text=True, capture_output=True, timeout=10, check=True,
+        )
+        self.assertEqual(json.loads(mismatched.stdout), [False])
+
+        env["XHS_LLM_BASE_URL"] = profile["base_url"]
+        matched = subprocess.run(
+            [sys.executable, "-c", script], cwd=str(ROOT), env=env,
+            text=True, capture_output=True, timeout=10, check=True,
+        )
+        self.assertEqual(json.loads(matched.stdout), [True])
+
+    def test_legacy_saved_model_keeps_environment_key_during_migration(self):
+        script = (
+            "import json, os; from app import _load_generator_profiles; "
+            "profiles = _load_generator_profiles(json.loads(os.environ['TEST_SETTINGS'])); "
+            "print(json.dumps([(item['model'], item['base_url'], bool(item['api_key'])) for item in profiles]))"
+        )
+        env = dict(os.environ)
+        env["XHS_WORKBENCH_DATA_DIR"] = str(self.data_dir)
+        env["XHS_LLM_MODEL"] = ""
+        env["XHS_LLM_BASE_URL"] = ""
+        env["XHS_LLM_API_KEY"] = "test-only-legacy-key"
+        env["TEST_SETTINGS"] = json.dumps({
+            "generator_model": "saved-custom-model",
+            "generator_base_url": "https://saved-relay.example/v1",
+            "generator_protocol": "chat_completions",
+            "generator_provider": "custom",
+        })
+        result = subprocess.run(
+            [sys.executable, "-c", script], cwd=str(ROOT), env=env,
+            text=True, capture_output=True, timeout=10, check=True,
+        )
+        self.assertEqual(json.loads(result.stdout), [[
+            "saved-custom-model", "https://saved-relay.example/v1", True,
+        ]])
+
 
 if __name__ == "__main__":
     unittest.main()

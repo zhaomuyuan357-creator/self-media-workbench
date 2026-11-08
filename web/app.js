@@ -10,6 +10,7 @@ let connectorMessage = "";
 let monitorTimer = null;
 let toapisPollTimer = null;
 let activeToapisGeneration = "";
+let selectedGeneratorProfileId = "";
 
 const pageTitles = {
   account: "账号定位", content: "内容制作", monitor: "账号监测",
@@ -191,23 +192,120 @@ function setPublisherSettings(settings) {
   $("#contentConnectionDot").classList.toggle("offline", mock);
 }
 
+const generatorProviderNames = {
+  custom: "自定义接口", openai: "OpenAI", deepseek: "DeepSeek",
+  qwen: "通义千问", aixhan: "AixHan 中转",
+};
+
+function currentGeneratorProfile() {
+  return (state.generator?.profiles || []).find((item) => item.id === selectedGeneratorProfileId) || null;
+}
+
+function syncGeneratorProfileForm() {
+  const profile = currentGeneratorProfile();
+  if (!profile) return;
+  profile.name = $("#generatorProfileName").value.trim();
+  profile.provider = $("#generatorProvider").value;
+  profile.base_url = $("#generatorBaseUrl").value.trim();
+  profile.protocol = $("#generatorProtocol").value;
+  profile.model = $("#generatorModel").value.trim();
+}
+
+function loadGeneratorProfileForm(profile) {
+  if (!profile) {
+    $("#generatorProfileName").value = "";
+    $("#generatorProvider").value = "custom";
+    $("#generatorBaseUrl").value = "https://api.openai.com/v1";
+    $("#generatorProtocol").value = "chat_completions";
+    $("#generatorModel").value = "";
+    $("#generatorApiKey").value = "";
+    $("#generatorApiKey").placeholder = "输入这套模型方案对应的 API Key";
+    $("#clearGeneratorKey").checked = false;
+    return;
+  }
+  $("#generatorProfileName").value = profile?.name || "";
+  $("#generatorProvider").value = profile?.provider || "custom";
+  $("#generatorBaseUrl").value = profile?.base_url || "https://api.openai.com/v1";
+  $("#generatorProtocol").value = profile?.protocol || "chat_completions";
+  $("#generatorModel").value = profile?.model || "";
+  $("#generatorApiKey").value = "";
+  $("#generatorApiKey").placeholder = profile?.key_in_memory
+    ? "已保存本次运行的密钥；留空保留，重启后需重新输入"
+    : "输入这套模型方案对应的 API Key";
+  $("#clearGeneratorKey").checked = false;
+}
+
+function renderGeneratorProfiles() {
+  const root = $("#generatorProfiles");
+  const profiles = state.generator?.profiles || [];
+  root.replaceChildren();
+  if (!profiles.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty-state";
+    empty.textContent = "还没有模型方案，添加一套兼容接口开始配置。";
+    root.append(empty);
+  }
+  profiles.forEach((profile, index) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `generator-profile-item${profile.id === selectedGeneratorProfileId ? " selected" : ""}`;
+    button.setAttribute("aria-pressed", profile.id === selectedGeneratorProfileId ? "true" : "false");
+    const rank = document.createElement("span");
+    rank.className = "generator-profile-rank";
+    rank.textContent = String(index + 1).padStart(2, "0");
+    const copy = document.createElement("span");
+    copy.className = "generator-profile-copy";
+    const name = document.createElement("b");
+    name.textContent = profile.name || "未命名方案";
+    const detail = document.createElement("small");
+    detail.textContent = `${generatorProviderNames[profile.provider] || "兼容接口"} · ${profile.model || "待填写模型 ID"}`;
+    copy.append(name, detail);
+    const status = document.createElement("span");
+    status.className = `generator-profile-state${profile.key_in_memory ? " ready" : ""}`;
+    status.textContent = profile.key_in_memory ? (index === 0 ? "首选 · 已配置" : "已配置") : (index === 0 ? "首选 · 待填 Key" : "待填 Key");
+    button.append(rank, copy, status);
+    button.addEventListener("click", () => {
+      syncGeneratorProfileForm();
+      selectedGeneratorProfileId = profile.id;
+      loadGeneratorProfileForm(profile);
+      renderGeneratorProfiles();
+    });
+    root.append(button);
+  });
+  const selectedIndex = profiles.findIndex((item) => item.id === selectedGeneratorProfileId);
+  $("#moveGeneratorProfileUpButton").disabled = selectedIndex <= 0;
+  $("#moveGeneratorProfileDownButton").disabled = selectedIndex < 0 || selectedIndex >= profiles.length - 1;
+  $("#deleteGeneratorProfileButton").disabled = selectedIndex < 0;
+}
+
 function setGeneratorSettings(settings) {
-  state.generator = settings;
-  $("#generatorBaseUrl").value = settings.base_url || "https://api.openai.com/v1";
-  $("#generatorModel").value = settings.model || "";
-  $("#generatorProvider").value = settings.provider || "custom";
-  $("#generatorProtocol").value = settings.protocol || "chat_completions";
-  const configured = Boolean(settings.configured);
-  $("#settingsGeneratorBadge").textContent = configured ? "待验证" : "未配置";
+  state.generator = settings || {};
+  state.generator.profiles = Array.isArray(settings?.profiles) ? settings.profiles : [];
+  $("#generatorAutoFallback").checked = settings?.auto_fallback !== false;
+  if (!state.generator.profiles.some((item) => item.id === selectedGeneratorProfileId)) {
+    selectedGeneratorProfileId = state.generator.profiles[0]?.id || "";
+  }
+  renderGeneratorProfiles();
+  loadGeneratorProfileForm(currentGeneratorProfile());
+  const configuredCount = state.generator.profiles.filter((item) => item.key_in_memory).length;
+  const configured = configuredCount > 0;
+  const primary = state.generator.profiles[0];
+  $("#settingsGeneratorBadge").textContent = state.generator.profiles.length
+    ? `${configuredCount}/${state.generator.profiles.length} 套已配置`
+    : "未配置";
   $("#settingsGeneratorBadge").className = `status-pill ${configured ? "pending" : "muted"}`;
-  $("#generatorStatusPill").textContent = configured ? `待验证 · ${settings.model}` : "模型未配置";
+  $("#generatorStatusPill").textContent = configured
+    ? `首选 · ${primary?.model || "模型方案"}` : "模型未配置";
   $("#generatorStatusPill").className = `status-pill ${configured ? "pending" : "muted"}`;
   $("#generationHint").textContent = configured
-    ? `已填写接口参数；点击“测试生成”确认 API Key 和模型可用。`
+    ? `已配置 ${configuredCount} 套模型；首选方案按列表顺序执行，模型仍需逐个测试。`
     : "模型未配置；点击生成会带你去连接模型服务。";
   if (configured) {
-    $("#generatorState").textContent = "接口参数已填写，尚未验证 API Key 和模型是否可用。";
+    $("#generatorState").textContent = "模型方案已保存；可分别测试连接。API Key 仅在本次运行中有效。";
     $("#generatorState").className = "settings-result pending";
+  } else {
+    $("#generatorState").textContent = "添加模型方案后，可分别测试并在内容制作中使用。";
+    $("#generatorState").className = "settings-result";
   }
 }
 
@@ -527,26 +625,87 @@ async function saveConnectionSettings(showToast = true) {
 }
 
 async function saveGeneratorSettings(showToast = true) {
+  syncGeneratorProfileForm();
+  const profiles = (state.generator?.profiles || []).map((profile) => ({
+    id: profile.id,
+    name: profile.name,
+    provider: profile.provider,
+    base_url: profile.base_url,
+    protocol: profile.protocol,
+    model: profile.model,
+  }));
   const apiKey = $("#generatorApiKey").value.trim();
-  const previous = state.generator || {};
-  const endpointChanged = Boolean(previous.base_url && previous.base_url !== $("#generatorBaseUrl").value.trim());
-  const providerChanged = Boolean(previous.provider && previous.provider !== $("#generatorProvider").value);
   const settings = await api("/api/generator/settings", jsonPost({
-    provider: $("#generatorProvider").value,
-    base_url: $("#generatorBaseUrl").value.trim(),
-    protocol: $("#generatorProtocol").value,
-    model: $("#generatorModel").value.trim(),
+    profiles,
+    auto_fallback: $("#generatorAutoFallback").checked,
+    api_key_profile_id: selectedGeneratorProfileId,
     api_key: apiKey,
     clear_api_key: $("#clearGeneratorKey").checked,
   }));
-  $("#generatorApiKey").value = "";
-  $("#clearGeneratorKey").checked = false;
   setGeneratorSettings(settings);
-  if (showToast) {
-    if ((endpointChanged || providerChanged) && !apiKey) toast("服务地址已切换，旧密钥已清除；请填入新服务对应的 API Key");
-    else toast(settings.configured ? "模型设置已保存" : "模型地址已保存；输入 API Key 后即可生成");
-  }
+  if (showToast) toast(settings.configured ? "模型方案和优先顺序已保存" : "模型方案已保存；填写 API Key 后即可连接");
   return settings;
+}
+
+function addGeneratorProfile() {
+  syncGeneratorProfileForm();
+  const id = globalThis.crypto?.randomUUID?.() || `model-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+  const profile = {
+    id, name: "", provider: "custom", base_url: "https://api.openai.com/v1",
+    protocol: "chat_completions", model: "", key_in_memory: false, configured: false,
+  };
+  state.generator.profiles.push(profile);
+  selectedGeneratorProfileId = id;
+  renderGeneratorProfiles();
+  loadGeneratorProfileForm(profile);
+  $("#generatorProfileName").focus();
+}
+
+async function moveGeneratorProfile(direction) {
+  syncGeneratorProfileForm();
+  const profiles = state.generator.profiles || [];
+  const index = profiles.findIndex((item) => item.id === selectedGeneratorProfileId);
+  const next = index + direction;
+  if (index < 0 || next < 0 || next >= profiles.length) return;
+  [profiles[index], profiles[next]] = [profiles[next], profiles[index]];
+  renderGeneratorProfiles();
+  try { await saveGeneratorSettings(false); toast("模型优先顺序已更新"); }
+  catch (error) {
+    [profiles[index], profiles[next]] = [profiles[next], profiles[index]];
+    renderGeneratorProfiles();
+    toast(error.message, true);
+  }
+}
+
+async function deleteGeneratorProfile() {
+  const profile = currentGeneratorProfile();
+  if (!profile || !window.confirm(`删除模型方案“${profile.name || profile.model || "未命名方案"}”？`)) return;
+  const profiles = state.generator.profiles.filter((item) => item.id !== profile.id);
+  const nextSelection = profiles[0]?.id || "";
+  try {
+    const settings = await api("/api/generator/settings", jsonPost({
+      profiles: profiles.map(({ id, name, provider, base_url, protocol, model }) => ({ id, name, provider, base_url, protocol, model })),
+      auto_fallback: $("#generatorAutoFallback").checked,
+    }));
+    selectedGeneratorProfileId = nextSelection;
+    setGeneratorSettings(settings);
+    toast("模型方案已删除");
+  } catch (error) { toast(error.message, true); }
+}
+
+function applyGeneratorProviderPreset() {
+  const presets = {
+    openai: { base_url: "https://api.openai.com/v1", protocol: "chat_completions" },
+    deepseek: { base_url: "https://api.deepseek.com", protocol: "chat_completions" },
+    qwen: { base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1", protocol: "chat_completions" },
+    aixhan: { base_url: "https://api.aixhan.com/v1", protocol: "responses" },
+  };
+  const preset = presets[$("#generatorProvider").value];
+  if (preset) {
+    $("#generatorBaseUrl").value = preset.base_url;
+    $("#generatorProtocol").value = preset.protocol;
+  }
+  syncGeneratorProfileForm();
 }
 
 function renderJobs(jobs) {
@@ -773,7 +932,7 @@ async function loadState() {
 async function generateCopy() {
   if (!state.generator?.configured) {
     navigate("settings");
-    toast("先连接一个兼容 OpenAI 的文案模型", true);
+    toast("先添加并连接至少一套兼容文案模型", true);
     $("#generatorApiKey").focus();
     return;
   }
@@ -785,9 +944,12 @@ async function generateCopy() {
     $("#postTitle").value = result.draft.title;
     $("#postBody").value = result.draft.body;
     $("#postTags").value = (result.draft.tags || []).join(", ");
-    $("#draftVersionHint").textContent = `基于定位 v${result.persona_version} · 可编辑`;
+    const routeNote = result.fallback_used ? ` · 已切换至备用方案 ${result.profile_name}` : ` · ${result.profile_name}`;
+    $("#draftVersionHint").textContent = `基于定位 v${result.persona_version}${routeNote} · ${result.model} · 可编辑`;
     updatePreview();
-    toast("文案草稿已生成，检查并编辑后再发布");
+    toast(result.fallback_used
+      ? `首选模型不可用，已由 ${result.profile_name} 完成生成`
+      : "文案草稿已生成，检查并编辑后再发布");
   } catch (error) { toast(error.message, true); }
   finally { button.disabled = false; button.innerHTML = "<span>✦</span>按账号定位生成文案"; }
 }
@@ -927,17 +1089,18 @@ async function checkConnection(showToast = true) {
 async function testGenerator() {
   const button = $("#testGeneratorButton"); button.disabled = true; button.textContent = "正在测试…";
   try {
-    if ($("#generatorApiKey").value.trim()) await saveGeneratorSettings(false);
-    const result = await api("/api/generator/test", jsonPost({}));
+    if (!selectedGeneratorProfileId) throw new Error("先添加一套模型方案");
+    await saveGeneratorSettings(false);
+    const result = await api("/api/generator/test", jsonPost({ profile_id: selectedGeneratorProfileId }));
     const settings = await api("/api/generator/settings"); setGeneratorSettings(settings);
     $("#settingsGeneratorBadge").textContent = "验证通过";
     $("#settingsGeneratorBadge").className = "status-pill success";
-    $("#generatorStatusPill").textContent = `验证通过 · ${settings.model}`;
+    $("#generatorStatusPill").textContent = `已连接 · ${result.model}`;
     $("#generatorStatusPill").className = "status-pill success";
-    $("#generationHint").textContent = `模型 ${settings.model} 已验证，可在内容制作页生成文案。`;
-    $("#generatorState").textContent = `模型调用成功 · 示例标题：${result.sample.title}`;
+    $("#generationHint").textContent = `${result.profile_name} · ${result.model} 已通过生成测试。`;
+    $("#generatorState").textContent = `模型调用成功 · ${result.profile_name} · 示例标题：${result.sample.title}`;
     $("#generatorState").className = "settings-result success";
-    toast("模型连接和生成测试成功");
+    toast(`${result.profile_name} 连接和生成测试成功`);
   } catch (error) {
     if (state.generator?.configured) {
       $("#settingsGeneratorBadge").textContent = "验证失败";
@@ -974,17 +1137,21 @@ $("#saveConnectionButton").addEventListener("click", () => saveConnectionSetting
 $("#checkConnectionButton").addEventListener("click", () => checkConnection(true));
 $("#publisherMode").addEventListener("change", () => saveConnectionSettings(false).catch((error) => toast(error.message, true)));
 $("#saveGeneratorButton").addEventListener("click", () => saveGeneratorSettings(true).catch((error) => toast(error.message, true)));
-$("#generatorProvider").addEventListener("change", () => {
-  if ($("#generatorProvider").value === "aixhan") {
-    $("#generatorBaseUrl").value = "https://api.aixhan.com/v1";
-    $("#generatorProtocol").value = "responses";
-  }
-});
+$("#addGeneratorProfileButton").addEventListener("click", addGeneratorProfile);
+$("#moveGeneratorProfileUpButton").addEventListener("click", () => moveGeneratorProfile(-1));
+$("#moveGeneratorProfileDownButton").addEventListener("click", () => moveGeneratorProfile(1));
+$("#deleteGeneratorProfileButton").addEventListener("click", deleteGeneratorProfile);
+$("#generatorProvider").addEventListener("change", applyGeneratorProviderPreset);
 $("#generatorBaseUrl").addEventListener("input", () => {
-  if ($("#generatorProvider").value === "aixhan" && $("#generatorBaseUrl").value.trim() !== "https://api.aixhan.com/v1") {
+  if ($("#generatorProvider").value !== "custom") {
     $("#generatorProvider").value = "custom";
   }
+  syncGeneratorProfileForm();
 });
+$("#generatorProfileName").addEventListener("input", syncGeneratorProfileForm);
+$("#generatorModel").addEventListener("input", syncGeneratorProfileForm);
+$("#generatorProtocol").addEventListener("change", syncGeneratorProfileForm);
+$("#generatorAutoFallback").addEventListener("change", () => saveGeneratorSettings(false).then(() => toast("自动切换设置已保存")).catch((error) => toast(error.message, true)));
 $("#testGeneratorButton").addEventListener("click", testGenerator);
 $("#saveToapisSettingsButton").addEventListener("click", () => saveToapisSettings(true).catch((error) => toast(error.message, true)));
 $("#checkToapisButton").addEventListener("click", checkToapis);

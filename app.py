@@ -6,6 +6,7 @@ import os
 import re
 import time
 import threading
+import uuid
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -13,7 +14,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 from workbench.publishers import PublisherError, publisher_for, validate_local_mcp_endpoint
-from workbench.generators import GeneratorError, OpenAICompatibleGenerator, validate_base_url
+from workbench.generators import GeneratorError, generate_with_profiles, validate_base_url
 from workbench.images import ImageGeneratorError, OpenAICompatibleImageGenerator
 from workbench.store import DuplicatePublishError, Repository
 from workbench.trends import TrendSourceError, agent_reach_status, scan_hotspots
@@ -30,13 +31,83 @@ MAX_UPLOAD_BYTES = 1024 * 1024 * 1024
 DATA = Repository()
 PUBLISH_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="xhs-publish")
 _saved_settings = DATA.get_settings()
-GENERATOR_RUNTIME = {
-    "base_url": _saved_settings.get("generator_base_url") or os.environ.get("XHS_LLM_BASE_URL", "https://api.openai.com/v1"),
-    "model": _saved_settings.get("generator_model") or os.environ.get("XHS_LLM_MODEL", ""),
-    "protocol": _saved_settings.get("generator_protocol", "chat_completions"),
-    "provider": _saved_settings.get("generator_provider", "custom"),
-    "api_key": os.environ.get("XHS_LLM_API_KEY", ""),
-}
+GENERATOR_PROVIDER_IDS = {"custom", "openai", "deepseek", "qwen", "aixhan"}
+
+
+def _load_generator_profiles(settings):
+    profiles = []
+    raw_profiles = settings.get("generator_profiles_json")
+    has_current_profile_list = False
+    if raw_profiles:
+        try:
+            values = json.loads(raw_profiles)
+            if isinstance(values, list):
+                has_current_profile_list = True
+                seen = set()
+                for index, raw in enumerate(values[:8]):
+                    if not isinstance(raw, dict):
+                        continue
+                    profile_id = str(raw.get("id") or "model-{}".format(index + 1))[:80]
+                    provider = str(raw.get("provider") or "custom")
+                    protocol = str(raw.get("protocol") or "chat_completions")
+                    model = str(raw.get("model") or "").strip()[:120]
+                    try:
+                        base_url = validate_base_url(raw.get("base_url") or "")
+                    except ValueError:
+                        continue
+                    if (not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", profile_id)
+                            or profile_id in seen or provider not in GENERATOR_PROVIDER_IDS
+                            or protocol not in {"chat_completions", "responses"} or not model):
+                        continue
+                    seen.add(profile_id)
+                    profiles.append({
+                        "id": profile_id,
+                        "name": str(raw.get("name") or model)[:80],
+                        "provider": provider,
+                        "base_url": base_url,
+                        "protocol": protocol,
+                        "model": model,
+                        "api_key": "",
+                    })
+        except (TypeError, ValueError):
+            profiles = []
+
+    if not has_current_profile_list:
+        model = settings.get("generator_model") or os.environ.get("XHS_LLM_MODEL", "")
+        if model:
+            provider = settings.get("generator_provider", "custom")
+            if provider not in GENERATOR_PROVIDER_IDS:
+                provider = "custom"
+            profiles = [{
+                "id": "legacy-default",
+                "name": "当前文案模型",
+                "provider": provider,
+                "base_url": settings.get("generator_base_url") or os.environ.get("XHS_LLM_BASE_URL", "https://api.openai.com/v1"),
+                "protocol": settings.get("generator_protocol", "chat_completions"),
+                "model": model,
+                "api_key": "",
+            }]
+            profiles[0]["base_url"] = validate_base_url(profiles[0]["base_url"])
+
+    env_key = os.environ.get("XHS_LLM_API_KEY", "")
+    env_model = os.environ.get("XHS_LLM_MODEL", "")
+    env_base_url = os.environ.get("XHS_LLM_BASE_URL", "https://api.openai.com/v1")
+    if profiles and env_key and not has_current_profile_list:
+        profiles[0]["api_key"] = env_key
+    elif profiles and env_key and env_model:
+        try:
+            env_base_url = validate_base_url(env_base_url)
+        except ValueError:
+            env_base_url = ""
+        target = next((item for item in profiles
+                       if item["model"] == env_model and item["base_url"] == env_base_url), None)
+        if target:
+            target["api_key"] = env_key
+    return profiles
+
+
+GENERATOR_PROFILES_RUNTIME = _load_generator_profiles(_saved_settings)
+GENERATOR_AUTO_FALLBACK = str(_saved_settings.get("generator_auto_fallback", "1")).lower() not in {"0", "false", "off"}
 IMAGE_RUNTIME = {
     "base_url": _saved_settings.get("image_base_url") or os.environ.get("XHS_IMAGE_BASE_URL", "https://api.openai.com/v1"),
     "model": _saved_settings.get("image_model") or os.environ.get("XHS_IMAGE_MODEL", "gpt-image-1"),
@@ -49,14 +120,111 @@ TOAPIS_RUNTIME = {
 
 
 def generator_public_settings():
-    return {
-        "base_url": GENERATOR_RUNTIME["base_url"],
-        "model": GENERATOR_RUNTIME["model"],
-        "protocol": GENERATOR_RUNTIME["protocol"],
-        "provider": GENERATOR_RUNTIME["provider"],
-        "configured": bool(GENERATOR_RUNTIME["model"] and GENERATOR_RUNTIME["api_key"]),
-        "key_in_memory": bool(GENERATOR_RUNTIME["api_key"]),
+    profiles = [{
+        "id": item["id"],
+        "name": item["name"],
+        "provider": item["provider"],
+        "base_url": item["base_url"],
+        "protocol": item["protocol"],
+        "model": item["model"],
+        "key_in_memory": bool(item.get("api_key")),
+        "configured": bool(item.get("model") and item.get("api_key")),
+    } for item in GENERATOR_PROFILES_RUNTIME]
+    preferred = profiles[0] if profiles else {
+        "id": "", "name": "", "provider": "custom",
+        "base_url": "https://api.openai.com/v1",
+        "protocol": "chat_completions", "model": "",
+        "key_in_memory": False, "configured": False,
     }
+    return {
+        **preferred,
+        "profiles": profiles,
+        "auto_fallback": GENERATOR_AUTO_FALLBACK,
+        "configured": any(item["configured"] for item in profiles),
+        "primary_configured": bool(profiles and profiles[0]["configured"]),
+        "key_in_memory": bool(profiles and profiles[0]["key_in_memory"]),
+    }
+
+
+def save_generator_profiles(value):
+    global GENERATOR_PROFILES_RUNTIME, GENERATOR_AUTO_FALLBACK
+    values = value.get("profiles")
+    api_key_profile_id = str(value.get("api_key_profile_id") or "")[:80]
+    api_key = str(value.get("api_key") or "").strip()[:2000]
+    clear_api_key = value.get("clear_api_key") is True
+    if not isinstance(values, list) or len(values) > 8:
+        raise ValueError("模型方案数量需要在 0 到 8 个之间")
+
+    old_by_id = {item["id"]: item for item in GENERATOR_PROFILES_RUNTIME}
+    profiles = []
+    seen = set()
+    for index, raw in enumerate(values):
+        if not isinstance(raw, dict):
+            raise ValueError("模型方案格式无效")
+        profile_id = str(raw.get("id") or uuid.uuid4().hex)[:80]
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", profile_id) or profile_id in seen:
+            raise ValueError("模型方案编号无效或重复")
+        seen.add(profile_id)
+        name = str(raw.get("name") or "").strip()[:80]
+        provider = str(raw.get("provider") or "custom").strip()
+        base_url = validate_base_url(raw.get("base_url") or "")
+        model = str(raw.get("model") or "").strip()[:120]
+        protocol = str(raw.get("protocol") or "chat_completions").strip()
+        if not name:
+            raise ValueError("请填写模型方案名称")
+        if not model:
+            raise ValueError("请填写模型名称")
+        if provider not in GENERATOR_PROVIDER_IDS:
+            raise ValueError("不支持的文案模型服务商类型")
+        if protocol not in {"chat_completions", "responses"}:
+            raise ValueError("文案模型接口协议无效")
+
+        old = old_by_id.get(profile_id, {})
+        key = old.get("api_key", "")
+        endpoint_changed = base_url != old.get("base_url") or provider != old.get("provider")
+        if profile_id == api_key_profile_id:
+            if clear_api_key:
+                key = ""
+            elif api_key:
+                key = api_key
+        if endpoint_changed and not (profile_id == api_key_profile_id and api_key and not clear_api_key):
+            key = ""
+        profiles.append({
+            "id": profile_id,
+            "name": name,
+            "provider": provider,
+            "base_url": base_url,
+            "protocol": protocol,
+            "model": model,
+            "api_key": key,
+        })
+
+    auto_fallback = value.get("auto_fallback") is not False
+    stored_profiles = [{key: item[key] for key in ("id", "name", "provider", "base_url", "protocol", "model")}
+                       for item in profiles]
+    settings_to_save = {
+        "generator_profiles_json": json.dumps(stored_profiles, ensure_ascii=False),
+        "generator_auto_fallback": "1" if auto_fallback else "0",
+    }
+    if profiles:
+        primary = profiles[0]
+        settings_to_save.update({
+            "generator_base_url": primary["base_url"],
+            "generator_model": primary["model"],
+            "generator_protocol": primary["protocol"],
+            "generator_provider": primary["provider"],
+        })
+    else:
+        settings_to_save.update({
+            "generator_base_url": "",
+            "generator_model": "",
+            "generator_protocol": "",
+            "generator_provider": "",
+        })
+    DATA.save_settings(settings_to_save)
+    GENERATOR_PROFILES_RUNTIME = profiles
+    GENERATOR_AUTO_FALLBACK = auto_fallback
+    return generator_public_settings()
 
 
 def image_public_settings():
@@ -373,39 +541,29 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 self._json(200, saved)
             elif path == "/api/generator/settings":
                 value = self._read_json()
-                base_url = validate_base_url(value.get("base_url") or "https://api.openai.com/v1")
-                model = str(value.get("model") or "").strip()[:120]
-                protocol = str(value.get("protocol") or "chat_completions").strip()
-                provider = str(value.get("provider") or "custom").strip()
-                api_key = str(value.get("api_key") or "").strip()[:2000]
-                if not model:
-                    raise ValueError("请填写模型名称")
-                if protocol not in {"chat_completions", "responses"}:
-                    raise ValueError("文案模型接口协议无效")
-                if provider not in {"custom", "aixhan"}:
-                    provider = "custom"
-                endpoint_changed = (
-                    base_url != GENERATOR_RUNTIME["base_url"]
-                    or provider != GENERATOR_RUNTIME["provider"]
-                )
-                GENERATOR_RUNTIME["base_url"] = base_url
-                GENERATOR_RUNTIME["model"] = model
-                GENERATOR_RUNTIME["protocol"] = protocol
-                GENERATOR_RUNTIME["provider"] = provider
-                if value.get("clear_api_key") is True:
-                    GENERATOR_RUNTIME["api_key"] = ""
-                elif api_key:
-                    GENERATOR_RUNTIME["api_key"] = api_key
-                elif endpoint_changed:
-                    # Never reuse a credential against a newly selected relay.
-                    GENERATOR_RUNTIME["api_key"] = ""
-                DATA.save_settings({
-                    "generator_base_url": base_url,
-                    "generator_model": model,
-                    "generator_protocol": protocol,
-                    "generator_provider": provider,
-                })
-                self._json(200, generator_public_settings())
+                if "profiles" not in value:
+                    # Preserve compatibility with the former single-profile settings API.
+                    current = [dict(item) for item in GENERATOR_PROFILES_RUNTIME]
+                    profile_id = current[0]["id"] if current else "legacy-default"
+                    metadata = {
+                        "id": profile_id,
+                        "name": current[0].get("name", "默认文案模型") if current else "默认文案模型",
+                        "provider": value.get("provider", "custom"),
+                        "base_url": value.get("base_url") or "https://api.openai.com/v1",
+                        "protocol": value.get("protocol", "chat_completions"),
+                        "model": value.get("model", ""),
+                    }
+                    profiles = [metadata]
+                    profiles.extend({key: item[key] for key in ("id", "name", "provider", "base_url", "protocol", "model")}
+                                    for item in current[1:])
+                    value = {
+                        "profiles": profiles,
+                        "auto_fallback": GENERATOR_AUTO_FALLBACK,
+                        "api_key_profile_id": profile_id,
+                        "api_key": value.get("api_key", ""),
+                        "clear_api_key": value.get("clear_api_key") is True,
+                    }
+                self._json(200, save_generator_profiles(value))
             elif path == "/api/image-generator/settings":
                 value = self._read_json()
                 base_url = validate_base_url(value.get("base_url") or "https://api.openai.com/v1")
@@ -536,12 +694,19 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                     record = DATA.get_toapis_generation(client_request_id)
                 self._json(202, _copy_toapis_generation_for_response(record))
             elif path == "/api/generator/test":
+                value = self._read_json()
                 result = self._generate({
                     "idea": "测试模型连接",
                     "brief": "请只返回简短的标题、正文和话题，不要使用事实数据。",
                     "sources": [],
+                }, preferred_profile_id=value.get("profile_id"), allow_fallback=False)
+                self._json(200, {
+                    "ok": True,
+                    "message": "模型生成测试成功",
+                    "sample": result["draft"],
+                    "profile_name": result["profile_name"],
+                    "model": result["model"],
                 })
-                self._json(200, {"ok": True, "message": "模型生成测试成功", "sample": result})
             elif path == "/api/assets":
                 self._upload_asset()
             elif path == "/api/connector/check":
@@ -586,7 +751,14 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                     self._error(409, "请先完成账号定位再生成文案")
                     return
                 result = self._generate(value)
-                self._json(200, {"draft": result, "persona_version": account["current_profile_version"]})
+                self._json(200, {
+                    "draft": result["draft"],
+                    "persona_version": account["current_profile_version"],
+                    "model": result["model"],
+                    "profile_name": result["profile_name"],
+                    "fallback_used": result["fallback_used"],
+                    "fallback_reason": result["fallback_reason"],
+                })
             elif path == "/api/images/generate":
                 value = self._read_json()
                 account = DATA.get_account()
@@ -627,18 +799,15 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             self._error(500, "工作台处理失败：{}".format(exc))
 
     def _generate(self, value):
-        generator = OpenAICompatibleGenerator(
-            GENERATOR_RUNTIME["base_url"],
-            GENERATOR_RUNTIME["model"],
-            GENERATOR_RUNTIME["api_key"],
-            protocol=GENERATOR_RUNTIME["protocol"],
-        )
         account = DATA.get_account()
-        return generator.generate(
+        return generate_with_profiles(
+            GENERATOR_PROFILES_RUNTIME,
             account["profile"],
             value.get("idea", ""),
             value.get("brief", ""),
             value.get("sources", []),
+            auto_fallback=GENERATOR_AUTO_FALLBACK if value.get("allow_fallback") is not False else False,
+            preferred_profile_id=value.get("preferred_profile_id"),
         )
 
     def _upload_asset(self):

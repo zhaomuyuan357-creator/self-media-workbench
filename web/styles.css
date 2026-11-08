@@ -334,6 +334,24 @@ h1 span { color: var(--accent); }
 .settings-result.error { color: #a84c42; background: var(--accent-pale); }
 .checkbox-field { display: flex; align-items: center; gap: 8px; margin: 0 0 12px; color: #7c7e76; font-size: 9px; }
 .checkbox-field input { accent-color: var(--accent); }
+.generator-manager-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 4px 0 9px; }
+.generator-manager-heading > div:first-child { display: grid; gap: 3px; min-width: 0; }
+.generator-manager-heading b { color: #5d5f58; font-size: 9px; }
+.generator-manager-heading small, .model-config-note { color: #96978f; font-size: 8px; line-height: 1.6; }
+.generator-order-actions { display: flex; flex-wrap: wrap; gap: 5px; justify-content: end; }
+.generator-order-actions .button { min-height: 29px; padding: 0 8px; font-size: 8px; }
+.generator-profile-list { display: grid; gap: 5px; margin-bottom: 10px; }
+.generator-profile-item { width: 100%; min-height: 48px; display: grid; grid-template-columns: 27px minmax(0, 1fr) auto; align-items: center; gap: 8px; padding: 7px 9px; border: 1px solid #ecebe5; border-radius: 7px; color: #5d5f58; background: #fff; text-align: left; }
+.generator-profile-item.selected { border-color: #d98a7f; background: #fffaf8; }
+.generator-profile-rank { display: grid; place-items: center; width: 24px; aspect-ratio: 1; border-radius: 6px; color: #74766e; background: #f2f2ee; font-size: 8px; font-weight: 700; }
+.generator-profile-copy { display: grid; min-width: 0; gap: 3px; }
+.generator-profile-copy b { overflow: hidden; color: #55574f; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.generator-profile-copy small { overflow: hidden; color: #999a92; font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
+.generator-profile-state { color: #8d713d; font-size: 8px; white-space: nowrap; }
+.generator-profile-state.ready { color: #527b61; }
+.generator-fallback-toggle { margin-top: 2px; }
+.model-config-note { margin: -7px 0 12px; }
+.generator-profile-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 13px; }
 .provider-roadmap { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-top: 14px; padding: 15px 17px; border: 1px solid #ecebe5; border-radius: 11px; background: #fff; }
 .provider-roadmap > div { display: flex; align-items: center; gap: 11px; }
 .roadmap-icon { width: 31px; height: 31px; display: grid; place-items: center; border-radius: 9px; color: #6c8292; background: #eef3f6; }
@@ -403,6 +421,10 @@ h1 span { color: var(--accent); }
   .account-layout, .content-layout, .settings-grid { grid-template-columns: 1fr; }
   .account-side { grid-template-columns: 1fr; }
   .profile-form-card, .next-step-card, .settings-card { padding: 15px; }
+  .generator-manager-heading { align-items: start; flex-direction: column; }
+  .generator-order-actions { justify-content: start; }
+  .generator-profile-form { grid-template-columns: 1fr; }
+  .generator-profile-form .span-2 { grid-column: auto; }
   .form-grid { gap: 11px; }
   .form-footer { align-items: start; flex-direction: column; }
   .form-footer .button { width: 100%; }

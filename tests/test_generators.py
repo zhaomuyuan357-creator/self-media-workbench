@@ -1,9 +1,11 @@
 import json
 import threading
 import unittest
+import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest.mock import patch
 
-from workbench.generators import GeneratorError, OpenAICompatibleGenerator
+from workbench.generators import GeneratorError, OpenAICompatibleGenerator, generate_with_profiles
 
 
 class GeneratorState:
@@ -116,6 +118,62 @@ class GeneratorTests(unittest.TestCase):
         # The redirecting endpoint receives the original request, but the
         # bearer token must never be sent to the target endpoint.
         self.assertEqual(GeneratorState.calls, [])
+
+    def test_router_falls_back_after_explicit_retryable_error(self):
+        calls = []
+
+        class FakeGenerator:
+            def __init__(self, base_url, model, api_key, protocol="chat_completions"):
+                self.model = model
+
+            def generate(self, *args):
+                calls.append(self.model)
+                if self.model == "low-cost":
+                    raise GeneratorError("HTTP 429", retryable=True, http_status=429)
+                return {"title": "备用标题", "body": "备用正文", "tags": []}
+
+        profiles = [
+            {"id": "cheap", "name": "低成本", "base_url": self.endpoint, "model": "low-cost", "protocol": "chat_completions", "api_key": "cheap-key"},
+            {"id": "backup", "name": "备用", "base_url": self.endpoint, "model": "strong-model", "protocol": "chat_completions", "api_key": "backup-key"},
+        ]
+        with patch("workbench.generators.OpenAICompatibleGenerator", FakeGenerator):
+            result = generate_with_profiles(profiles, {}, "测试选题", auto_fallback=True)
+        self.assertEqual(calls, ["low-cost", "strong-model"])
+        self.assertTrue(result["fallback_used"])
+        self.assertEqual(result["profile_name"], "备用")
+
+    def test_only_rate_limit_http_error_is_retryable(self):
+        generator = OpenAICompatibleGenerator(self.endpoint, "test-model", "test-key")
+        for status, retryable in ((429, True), (502, False), (504, False)):
+            with self.subTest(status=status):
+                http_error = urllib.error.HTTPError(
+                    self.endpoint, status, "test error", {}, None,
+                )
+                with patch("workbench.generators.urllib.request.build_opener") as build_opener:
+                    build_opener.return_value.open.side_effect = http_error
+                    with self.assertRaises(GeneratorError) as raised:
+                        generator.generate({}, "测试")
+                self.assertEqual(raised.exception.retryable, retryable)
+
+    def test_router_does_not_retry_uncertain_or_nonretryable_errors(self):
+        calls = []
+
+        class FakeGenerator:
+            def __init__(self, base_url, model, api_key, protocol="chat_completions"):
+                self.model = model
+
+            def generate(self, *args):
+                calls.append(self.model)
+                raise GeneratorError("连接中断，状态不明", retryable=False)
+
+        profiles = [
+            {"id": "primary", "name": "首选", "base_url": self.endpoint, "model": "primary-model", "protocol": "chat_completions", "api_key": "primary-key"},
+            {"id": "backup", "name": "备用", "base_url": self.endpoint, "model": "backup-model", "protocol": "chat_completions", "api_key": "backup-key"},
+        ]
+        with patch("workbench.generators.OpenAICompatibleGenerator", FakeGenerator):
+            with self.assertRaisesRegex(GeneratorError, "连接中断"):
+                generate_with_profiles(profiles, {}, "测试选题", auto_fallback=True)
+        self.assertEqual(calls, ["primary-model"])
 
 
 if __name__ == "__main__":

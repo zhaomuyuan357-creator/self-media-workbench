@@ -210,15 +210,22 @@
               <div id="connectionState" class="settings-result">连接状态尚未检查。</div>
             </section>
             <section class="surface settings-card">
-              <div class="surface-heading"><div><h2>文案生成模型</h2><p>可配置不同中转服务的地址、协议和模型；CC Switch 负责管理配置，工作台直接请求服务地址。</p></div><span id="settingsGeneratorBadge" class="status-pill muted">未配置</span></div>
-              <label class="field"><span>服务商快捷配置</span><select id="generatorProvider"><option value="custom">自定义兼容接口</option><option value="aixhan">AixHan 中转（CC Switch 配置）</option></select><small>快捷配置只填写公开接口地址和协议，不会读取 CC Switch 的密钥。</small></label>
-              <label class="field"><span>接口地址</span><input id="generatorBaseUrl" type="url" value="https://api.openai.com/v1" placeholder="https://api.example.com/v1"></label>
-              <label class="field"><span>接口协议</span><select id="generatorProtocol"><option value="chat_completions">Chat Completions</option><option value="responses">Responses</option></select></label>
-              <label class="field"><span>模型名称</span><input id="generatorModel" maxlength="120" placeholder="例如：你的模型服务所提供的模型名"></label>
-              <label class="field"><span>API Key</span><input id="generatorApiKey" type="password" autocomplete="new-password" placeholder="输入与当前服务商匹配的 API Key"><small>密钥只保存在工作台内存；切换接口地址后旧密钥会自动清除，重启后也需要重新输入。</small></label>
-              <label class="checkbox-field"><input id="clearGeneratorKey" type="checkbox"><span>清除本次运行中已保存的密钥</span></label>
-              <div class="settings-actions"><button id="saveGeneratorButton" class="button button-subtle" type="button">保存模型设置</button><button id="testGeneratorButton" class="button button-primary" type="button">测试生成</button></div>
-              <div id="generatorState" class="settings-result">模型还未配置；配置后内容页可按账号定位生成文案。</div>
+              <div class="surface-heading"><div><h2>文案模型方案</h2><p>添加多家兼容服务，优先顺序由你决定；便宜模型可放在首位。</p></div><span id="settingsGeneratorBadge" class="status-pill muted">未配置</span></div>
+              <div class="generator-manager-heading"><div><b>模型优先顺序</b><small>第一项是默认模型，自动切换时依次尝试后续方案。</small></div><div class="generator-order-actions"><button id="addGeneratorProfileButton" class="button button-subtle" type="button">新增方案</button><button id="moveGeneratorProfileUpButton" class="button button-subtle" type="button" title="将当前方案上移">上移</button><button id="moveGeneratorProfileDownButton" class="button button-subtle" type="button" title="将当前方案下移">下移</button><button id="deleteGeneratorProfileButton" class="button button-subtle" type="button">删除</button></div></div>
+              <div id="generatorProfiles" class="generator-profile-list"><div class="empty-state">还没有模型方案，添加一套兼容接口开始配置。</div></div>
+              <label class="checkbox-field generator-fallback-toggle"><input id="generatorAutoFallback" type="checkbox" checked><span>首选模型被限流（HTTP 429）时，自动切换到下一个已连接模型</span></label>
+              <p class="model-config-note">其他服务错误、连接超时或返回格式异常时不会自动重发，因为无法确认上一次请求是否已计费。</p>
+              <div class="generator-profile-form">
+                <label class="field"><span>方案名称</span><input id="generatorProfileName" maxlength="80" placeholder="例如：DeepSeek 低成本"></label>
+                <label class="field"><span>服务商快捷配置</span><select id="generatorProvider"><option value="custom">自定义兼容接口</option><option value="deepseek">DeepSeek 官方接口</option><option value="qwen">阿里云百炼 · 通义千问</option><option value="openai">OpenAI 官方接口</option><option value="aixhan">AixHan 中转</option></select></label>
+                <label class="field span-2"><span>接口地址</span><input id="generatorBaseUrl" type="url" value="https://api.openai.com/v1" placeholder="https://api.example.com/v1"></label>
+                <label class="field"><span>接口协议</span><select id="generatorProtocol"><option value="chat_completions">Chat Completions</option><option value="responses">Responses</option></select></label>
+                <label class="field"><span>模型 ID</span><input id="generatorModel" maxlength="120" placeholder="按服务商控制台填写准确模型 ID"></label>
+                <label class="field span-2"><span>API Key</span><input id="generatorApiKey" type="password" autocomplete="new-password" placeholder="输入这套模型方案对应的 API Key"><small>每套方案分别配置密钥。密钥只保存在工作台进程内存，重启后需重新输入。</small></label>
+              </div>
+              <label class="checkbox-field"><input id="clearGeneratorKey" type="checkbox"><span>清除当前方案在本次运行中已保存的密钥</span></label>
+              <div class="settings-actions"><button id="saveGeneratorButton" class="button button-subtle" type="button">保存方案顺序和设置</button><button id="testGeneratorButton" class="button button-primary" type="button">测试当前方案</button></div>
+              <div id="generatorState" class="settings-result">添加模型方案后，可分别测试并在内容制作中使用。</div>
             </section>
             <section class="surface settings-card">
               <div class="surface-heading"><div><h2>ToAPIs 图片与视频服务</h2><p>通过 ToAPIs MCP 查模型、读参数并提交异步生成；API Key 只保存在工作台内存。</p></div><span id="settingsToapisBadge" class="status-pill muted">未连接</span></div>

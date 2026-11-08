@@ -12,7 +12,10 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 
 class GeneratorError(Exception):
-    pass
+    def __init__(self, message, retryable=False, http_status=None):
+        super().__init__(message)
+        self.retryable = bool(retryable)
+        self.http_status = http_status
 
 
 def validate_base_url(value):
@@ -103,11 +106,20 @@ class OpenAICompatibleGenerator:
                     detail = error_body["message"]
             except Exception:
                 detail = ""
-            raise GeneratorError("模型接口返回 HTTP {}{}".format(
-                exc.code, ("：" + str(detail)[:300]) if detail else ""
-            ))
+            detail = str(detail)[:300]
+            if self.api_key:
+                detail = detail.replace(self.api_key, "[已隐藏]")
+            raise GeneratorError(
+                "模型接口返回 HTTP {}{}".format(
+                    exc.code, ("：" + detail) if detail else ""
+                ),
+                retryable=exc.code == 429,
+                http_status=exc.code,
+            )
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            raise GeneratorError("无法连接模型接口：{}".format(exc))
+            raise GeneratorError(
+                "模型请求连接中断，是否已计费无法确认；为避免重复提交，未自动切换模型。详情：{}".format(exc)
+            )
         except (ValueError, UnicodeDecodeError):
             raise GeneratorError("模型接口返回了无法识别的响应")
 
@@ -144,3 +156,70 @@ class OpenAICompatibleGenerator:
         if not title or not body:
             raise GeneratorError("生成结果缺少标题或正文，请重试")
         return {"title": title[:20], "body": body[:1000], "tags": tags}
+
+
+def generate_with_profiles(
+    profiles,
+    account_profile,
+    idea,
+    brief="",
+    sources=None,
+    auto_fallback=True,
+    preferred_profile_id=None,
+):
+    """Generate with the ordered model profiles, falling back only on explicit transient HTTP errors."""
+    ordered = list(profiles or [])
+    if preferred_profile_id:
+        selected = next((item for item in ordered if item["id"] == preferred_profile_id), None)
+        if selected is None:
+            raise GeneratorError("没有找到所选的文案模型方案")
+        ordered = [selected]
+        auto_fallback = False
+    elif not auto_fallback:
+        ordered = ordered[:1]
+
+    if not ordered:
+        raise GeneratorError("请先在服务设置中添加文案模型方案")
+
+    preferred_id = ordered[0]["id"]
+    failure_messages = []
+    attempted = False
+    for index, profile in enumerate(ordered):
+        name = profile.get("name") or profile.get("model") or "文案模型"
+        api_key = profile.get("api_key", "")
+        if not api_key:
+            failure_messages.append("{}尚未配置 API Key".format(name))
+            if preferred_profile_id or not auto_fallback:
+                break
+            continue
+
+        generator = OpenAICompatibleGenerator(
+            profile["base_url"], profile["model"], api_key,
+            protocol=profile["protocol"],
+        )
+        attempted = True
+        try:
+            draft = generator.generate(account_profile, idea, brief, sources)
+            return {
+                "draft": draft,
+                "profile_id": profile["id"],
+                "profile_name": name,
+                "model": profile["model"],
+                "fallback_used": profile["id"] != preferred_id,
+                "fallback_reason": "; ".join(failure_messages),
+            }
+        except GeneratorError as exc:
+            if exc.retryable and auto_fallback and index < len(ordered) - 1:
+                failure_messages.append("{}：{}".format(name, exc))
+                continue
+            if failure_messages:
+                raise GeneratorError("{}；{}：{}".format(
+                    "；".join(failure_messages), name, exc,
+                ))
+            raise
+
+    if failure_messages:
+        raise GeneratorError("；".join(failure_messages))
+    if not attempted:
+        raise GeneratorError("没有已连接的文案模型方案，请先填写 API Key")
+    raise GeneratorError("文案模型方案均不可用")
