@@ -1,5 +1,5 @@
 const $ = (selector) => document.querySelector(selector);
-let state = { account: null, jobs: [], settings: {}, monitor: [], generator: {}, imageGenerator: {}, toapis: {}, trendItems: [], generatedImages: [], agentReach: {} };
+let state = { account: null, jobs: [], settings: {}, monitor: [], generator: {}, toapis: {}, trendItems: [], generatedImages: [], agentReach: {} };
 let selectedImageIds = [];
 let selectedSources = [];
 let verifyJobId = null;
@@ -10,6 +10,7 @@ let connectorMessage = "";
 let monitorTimer = null;
 let toapisPollTimer = null;
 let activeToapisGeneration = "";
+let activeToapisGenerationSource = "media";
 let selectedGeneratorProfileId = "";
 
 const pageTitles = {
@@ -173,7 +174,8 @@ function updatePreview() {
   $("#checkImage").classList.toggle("done", hasImage);
   $("#checkCopy").textContent = hasCopy ? "✓" : "○";
   $("#checkCopy").classList.toggle("done", hasCopy);
-  $("#generateImageButton").disabled = !hasCopy || !state.imageGenerator?.configured;
+  const imageReady = Boolean(state.toapis?.configured && state.toapis?.image_model);
+  $("#generateImageButton").disabled = !hasCopy || !imageReady;
 }
 
 function setPublisherSettings(settings) {
@@ -309,24 +311,15 @@ function setGeneratorSettings(settings) {
   }
 }
 
-function setImageGeneratorSettings(settings) {
-  state.imageGenerator = settings || {};
-  $("#imageBaseUrl").value = settings.base_url || "https://api.openai.com/v1";
-  $("#imageModel").value = settings.model || "gpt-image-1";
-  const configured = Boolean(settings.configured);
-  $("#settingsImageBadge").textContent = configured ? "已配置" : "未配置";
-  $("#settingsImageBadge").className = `status-pill ${configured ? "success" : "muted"}`;
-  $("#imageGeneratorStatusPill").textContent = configured ? `已连接 · ${settings.model}` : "生图服务未配置";
-  $("#imageGeneratorStatusPill").className = `status-pill ${configured ? "success" : "muted"}`;
-  $("#imageGeneratorState").textContent = configured
-    ? "生图服务已就绪；每次生成会调用已配置的模型接口。"
-    : "配置后可在内容制作页生成配图。API Key 只保存在本次工作台进程内存。";
-  updatePreview();
-}
-
 function setToapisSettings(settings) {
   state.toapis = settings || {};
   $("#toapisRegion").value = settings.region || "com";
+  const imageModel = settings.image_model || "";
+  const imageSelect = $("#toapisImageModel");
+  if (imageModel && !Array.from(imageSelect.options).some((option) => option.value === imageModel)) {
+    imageSelect.add(new Option(`${imageModel} · 已保存`, imageModel));
+  }
+  imageSelect.value = imageModel;
   const configured = Boolean(settings.configured);
   $("#settingsToapisBadge").textContent = configured ? "已配置" : "未连接";
   $("#settingsToapisBadge").className = `status-pill ${configured ? "success" : "muted"}`;
@@ -336,6 +329,16 @@ function setToapisSettings(settings) {
     ? "读取模型和参数说明后即可提交任务；生成任务可能需要数分钟。"
     : "请先在服务设置中配置 ToAPIs Key 并完成账号定位。";
   $("#toapisGenerateButton").disabled = !configured || !state.account?.configured;
+  const imageReady = configured && Boolean(imageModel);
+  $("#settingsImageBadge").textContent = imageReady ? "已配置" : configured ? "待选择" : "未连接";
+  $("#settingsImageBadge").className = `status-pill ${imageReady ? "success" : configured ? "pending" : "muted"}`;
+  $("#imageGeneratorStatusPill").textContent = imageReady ? `ToAPIs · ${imageModel}` : "ToAPIs 图片模型未配置";
+  $("#imageGeneratorStatusPill").className = `status-pill ${imageReady ? "success" : "muted"}`;
+  $("#imageGeneratorState").textContent = imageReady
+    ? `笔记配图将通过 ToAPIs 的 ${imageModel} 生成。`
+    : "连接 ToAPIs 后读取可用图片模型并保存默认模型。";
+  $("#saveToapisImageModelButton").disabled = !imageSelect.value || imageSelect.value === imageModel;
+  updatePreview();
 }
 
 async function saveToapisSettings(showToast = true) {
@@ -343,7 +346,8 @@ async function saveToapisSettings(showToast = true) {
   const previousRegion = state.toapis?.region;
   const region = $("#toapisRegion").value;
   const settings = await api("/api/toapis/settings", jsonPost({
-    region, api_key: apiKey, clear_api_key: $("#clearToapisKey").checked,
+    region, api_key: apiKey, image_model: $("#toapisImageModel").value.trim(),
+    clear_api_key: $("#clearToapisKey").checked,
   }));
   $("#toapisApiKey").value = "";
   $("#clearToapisKey").checked = false;
@@ -361,8 +365,7 @@ async function loadToapisModels() {
   button.disabled = true; button.textContent = "正在读取…";
   try {
     if ($("#toapisApiKey").value.trim()) await saveToapisSettings(false);
-    const mediaType = $("#toapisMediaType").value;
-    const value = await api(`/api/toapis/models?type=${encodeURIComponent(mediaType)}`);
+    const value = await api("/api/toapis/models?type=video");
     $("#toapisModelList").textContent = value.models || "ToAPIs 没有返回模型列表。";
     const hasModels = value.has_models !== false;
     $("#toapisSettingsState").textContent = hasModels
@@ -379,6 +382,56 @@ async function loadToapisModels() {
   } finally { button.disabled = false; button.textContent = "读取模型列表"; }
 }
 
+function populateToapisImageModels(models, preferred = state.toapis?.image_model || "") {
+  const select = $("#toapisImageModel");
+  const options = (models || []).filter((item) => item?.id).map((item) => ({
+    id: String(item.id), label: String(item.label || item.id),
+  }));
+  const unique = options.filter((item, index) => options.findIndex((candidate) => candidate.id === item.id) === index);
+  select.replaceChildren(new Option(unique.length ? "选择笔记配图模型" : "没有读取到可用图片模型", ""));
+  unique.forEach((item) => select.add(new Option(item.label, item.id)));
+  let selected = unique.some((item) => item.id === preferred) ? preferred : "";
+  if (!selected && unique.length) {
+    selected = unique.find((item) => item.id.toLowerCase().replace(/[^a-z0-9]/g, "").includes("image2"))?.id || unique[0].id;
+  }
+  select.value = selected;
+  $("#saveToapisImageModelButton").disabled = !selected || selected === (state.toapis?.image_model || "");
+  return unique;
+}
+
+async function loadToapisImageModels() {
+  const button = $("#loadToapisImageModelsButton");
+  button.disabled = true; button.textContent = "正在读取…";
+  try {
+    if ($("#toapisApiKey").value.trim()) await saveToapisSettings(false);
+    const value = await api("/api/toapis/models?type=image");
+    const models = populateToapisImageModels(value.model_options, state.toapis?.image_model || "");
+    $("#imageGeneratorState").textContent = models.length
+      ? `已读取 ${models.length} 个图片模型。确认选择后保存默认模型。`
+      : value.models || "当前 ToAPIs Key 没有返回可识别的图片模型。";
+    $("#imageGeneratorState").className = `settings-result ${models.length ? "success" : "pending"}`;
+    $("#saveToapisImageModelButton").disabled = !$("#toapisImageModel").value
+      || $("#toapisImageModel").value === (state.toapis?.image_model || "");
+  } catch (error) {
+    $("#imageGeneratorState").textContent = error.message;
+    $("#imageGeneratorState").className = "settings-result error";
+    toast(error.message, true);
+  } finally { button.disabled = false; button.textContent = "读取图片模型"; }
+}
+
+async function saveToapisImageModel() {
+  const imageModel = $("#toapisImageModel").value.trim();
+  if (!imageModel) { toast("先选择一个可用图片模型", true); return; }
+  try {
+    const settings = await api("/api/toapis/settings", jsonPost({
+      region: $("#toapisRegion").value,
+      image_model: imageModel,
+    }));
+    setToapisSettings(settings);
+    toast(`笔记配图模型已保存：${imageModel}`);
+  } catch (error) { toast(error.message, true); }
+}
+
 async function checkToapis() {
   const button = $("#checkToapisButton");
   button.disabled = true; button.textContent = "正在检查…";
@@ -391,6 +444,9 @@ async function checkToapis() {
       `${type === "image" ? "图片" : "视频"}模型${item.ok ? `（${item.count || 0} 个）` : ""}：\n${item.ok ? item.value : `读取失败：${item.error || "未知错误"}`}`
     );
     $("#toapisModelList").textContent = modelDetails.join("\n\n") || models.value || "ToAPIs 没有返回模型列表。";
+    if (models.by_type?.image?.model_options?.length) {
+      populateToapisImageModels(models.by_type.image.model_options, state.toapis?.image_model || "");
+    }
     if (models.schema) {
       const schema = models.schema;
       $("#toapisModelList").textContent += `\n\nlist_models 要求字段：${schema.required?.join("、") || "无"}`;
@@ -438,7 +494,7 @@ async function loadToapisDocs() {
     $("#toapisModelDocs").textContent = docs.docs || "该模型没有返回参数说明。";
     $("#toapisParams").dataset.documented = JSON.stringify(docs.parameter_names || []);
     if (!$("#toapisParams").value.trim() && (docs.parameter_names || []).some((name) => name.toLowerCase() === "prompt")) {
-      const prompt = $("#toapisMediaType").value === "image" ? suggestedImagePrompt() : $("#contentIdea").value.trim();
+      const prompt = $("#contentIdea").value.trim();
       if (prompt) $("#toapisParams").value = JSON.stringify({ prompt }, null, 2);
     }
     $("#toapisGenerationState").textContent = "已读取模型文档。请按字段说明调整参数 JSON，再提交生成。";
@@ -461,27 +517,55 @@ function renderToapisVideo(asset) {
   card.append(video, title, link); root.prepend(card);
 }
 
-function showToapisGeneration(record) {
+function showToapisGeneration(record, source = activeToapisGenerationSource) {
   activeToapisGeneration = record.client_request_id;
+  activeToapisGenerationSource = source;
   const stateText = record.state;
   if (record.asset) {
     if (record.media_type === "image") {
       const images = [record.asset, ...state.generatedImages];
       renderGeneratedImages(images.filter((image, index) => images.findIndex((candidate) => candidate.id === image.id) === index));
+      if (source === "note-image" && stateText === "completed") {
+        const alreadySelected = selectedImageIds.includes(record.asset.id);
+        const canSelect = alreadySelected || selectedImageIds.length < 9;
+        if (!alreadySelected && canSelect) selectedImageIds.push(record.asset.id);
+        renderGeneratedImages(state.generatedImages);
+        $("#imageState").textContent = canSelect
+          ? "配图已生成并加入当前笔记。"
+          : "配图已保存到本机，但当前笔记已选满 9 张；移除一张后可加入。";
+        $("#imageState").className = `settings-result ${canSelect ? "success" : "pending"}`;
+        toast(canSelect ? "ToAPIs 配图已生成并加入笔记" : "配图已保存；笔记最多选择 9 张", !canSelect);
+      }
     }
     else renderToapisVideo(record.asset);
   }
   const labels = { starting: "正在提交", running: "生成中", unknown: "结果待确认", completed: "已完成并保存到本机", failed: "生成失败", delivery_error: "生成完成但保存失败" };
-  $("#toapisGenerationState").textContent = `${labels[stateText] || stateText}${record.task_id ? ` · 任务 ${record.task_id}` : ""}${record.error_text ? `\n${record.error_text}` : ""}`;
-  $("#toapisGenerationState").className = `settings-result ${stateText === "completed" ? "success" : ["failed", "delivery_error"].includes(stateText) ? "error" : "pending"}`;
-  $("#toapisRetryDownloadButton").hidden = stateText !== "delivery_error";
+  const statusText = source === "note-image" && stateText === "completed"
+    ? `配图已生成${selectedImageIds.includes(record.asset?.id) ? "并加入当前笔记" : "并保存到本机"}`
+    : `${labels[stateText] || stateText}${record.task_id ? ` · 任务 ${record.task_id}` : ""}${record.error_text ? `\n${record.error_text}` : ""}`;
+  const statusClass = `settings-result ${stateText === "completed" ? "success" : ["failed", "delivery_error"].includes(stateText) ? "error" : "pending"}`;
+  const noteImage = source === "note-image";
+  const statusNode = noteImage ? $("#imageState") : $("#toapisGenerationState");
+  statusNode.textContent = statusText;
+  statusNode.className = statusClass;
+  $("#toapisRetryDownloadButton").hidden = noteImage || stateText !== "delivery_error";
+  $("#retryNoteImageDownloadButton").hidden = !noteImage || stateText !== "delivery_error";
   if (["running", "starting"].includes(stateText)) {
+    const activeButton = source === "note-image" ? $("#generateImageButton") : $("#toapisGenerateButton");
+    activeButton.disabled = true;
+    activeButton.textContent = source === "note-image" ? "正在生成配图…" : "正在生成…";
     clearTimeout(toapisPollTimer);
     toapisPollTimer = setTimeout(pollToapisGeneration, Math.max(1, record.poll_after_seconds || 5) * 1000);
   } else {
     clearTimeout(toapisPollTimer); toapisPollTimer = null;
-    $("#toapisGenerateButton").disabled = !state.toapis?.configured || !state.account?.configured || stateText === "delivery_error";
-    $("#toapisGenerateButton").textContent = stateText === "unknown" ? "查询任务状态" : stateText === "delivery_error" ? "请先重试下载" : "提交 ToAPIs 生成任务";
+    if (noteImage) {
+      $("#generateImageButton").disabled = !state.toapis?.configured || !state.toapis?.image_model
+        || !state.account?.configured || stateText === "delivery_error";
+      $("#generateImageButton").textContent = stateText === "unknown" ? "查询任务状态" : "生成配图";
+    } else {
+      $("#toapisGenerateButton").disabled = !state.toapis?.configured || !state.account?.configured || stateText === "delivery_error";
+      $("#toapisGenerateButton").textContent = stateText === "unknown" ? "查询任务状态" : stateText === "delivery_error" ? "请先重试下载" : "提交 ToAPIs 生成任务";
+    }
   }
 }
 
@@ -491,10 +575,13 @@ async function pollToapisGeneration() {
     const record = await api(`/api/toapis/generations/${encodeURIComponent(activeToapisGeneration)}`);
     showToapisGeneration(record);
   } catch (error) {
-    $("#toapisGenerationState").textContent = `${error.message}\n请求状态尚未确认；请稍后查询，不要重复提交。`;
-    $("#toapisGenerationState").className = "settings-result error";
-    $("#toapisGenerateButton").disabled = false;
-    $("#toapisGenerateButton").textContent = "查询任务状态";
+    const noteImage = activeToapisGenerationSource === "note-image";
+    const statusNode = noteImage ? $("#imageState") : $("#toapisGenerationState");
+    statusNode.textContent = `${error.message}\n请求状态尚未确认；请稍后查询，不要重复提交。`;
+    statusNode.className = "settings-result error";
+    const button = noteImage ? $("#generateImageButton") : $("#toapisGenerateButton");
+    button.disabled = false;
+    button.textContent = "查询任务状态";
   }
 }
 
@@ -507,12 +594,13 @@ async function submitToapisGeneration() {
   catch (_) { toast("模型参数 JSON 格式不正确", true); return; }
   const button = $("#toapisGenerateButton");
   button.disabled = true; button.textContent = "正在提交…";
+  activeToapisGenerationSource = "media";
   $("#toapisGenerationState").textContent = "正在核对模型列表和参数文档，再提交一次生成请求。";
   const clientRequestId = `toapis-${Math.floor(Date.now() / 1000)}-${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`;
   activeToapisGeneration = clientRequestId;
   try {
     const record = await api("/api/toapis/generations", jsonPost({
-      media_type: $("#toapisMediaType").value,
+      media_type: "video",
       model: $("#toapisModel").value.trim(), params, client_request_id: clientRequestId,
     }));
     showToapisGeneration(record);
@@ -536,7 +624,8 @@ async function submitToapisGeneration() {
 
 async function retryToapisDownload() {
   if (!activeToapisGeneration) return;
-  const button = $("#toapisRetryDownloadButton");
+  const noteImage = activeToapisGenerationSource === "note-image";
+  const button = noteImage ? $("#retryNoteImageDownloadButton") : $("#toapisRetryDownloadButton");
   button.disabled = true; button.textContent = "正在重试下载…";
   try {
     const record = await api(
@@ -546,27 +635,13 @@ async function retryToapisDownload() {
     showToapisGeneration(record);
     if (record.state === "completed") toast("生成结果已保存到本机素材库");
   } catch (error) {
-    $("#toapisGenerationState").textContent = `${error.message}\n可再次重试下载；不会重新提交生成任务。`;
-    $("#toapisGenerationState").className = "settings-result error";
+    const statusNode = noteImage ? $("#imageState") : $("#toapisGenerationState");
+    statusNode.textContent = `${error.message}\n可再次重试下载；不会重新提交生成任务。`;
+    statusNode.className = "settings-result error";
     toast(error.message, true);
   } finally {
     button.disabled = false; button.textContent = "重试下载结果";
   }
-}
-
-async function saveImageGeneratorSettings(showToast = true) {
-  const apiKey = $("#imageApiKey").value.trim();
-  const settings = await api("/api/image-generator/settings", jsonPost({
-    base_url: $("#imageBaseUrl").value.trim(),
-    model: $("#imageModel").value.trim(),
-    api_key: apiKey,
-    clear_api_key: $("#clearImageKey").checked,
-  }));
-  $("#imageApiKey").value = "";
-  $("#clearImageKey").checked = false;
-  setImageGeneratorSettings(settings);
-  if (showToast) toast(settings.configured ? "生图服务设置已保存" : "生图地址已保存；输入 API Key 后即可生成");
-  return settings;
 }
 
 function renderGeneratedImages(images) {
@@ -910,7 +985,6 @@ async function loadState() {
   fillAccount(result.account);
   setPublisherSettings(result.settings);
   setGeneratorSettings(result.generator || {});
-  setImageGeneratorSettings(result.image_generator || {});
   setToapisSettings(result.toapis || {});
   const trendResult = await api("/api/trends/status").catch(() => ({}));
   setTrendStatus(trendResult.agent_reach || {});
@@ -919,7 +993,10 @@ async function loadState() {
   renderMonitor(result.monitor || []);
   (result.toapis_generations || []).filter((item) => item.asset?.media_type === "video").forEach(renderToapisVideo);
   const latestToapisGeneration = (result.toapis_generations || []).find((item) => ["starting", "running", "unknown", "delivery_error"].includes(item.state));
-  if (latestToapisGeneration) showToapisGeneration(latestToapisGeneration);
+  if (latestToapisGeneration) showToapisGeneration(
+    latestToapisGeneration,
+    latestToapisGeneration.media_type === "image" ? "note-image" : "media",
+  );
   if (!$("#postTags").value && result.account?.profile?.preferred_topics?.length) {
     $("#postTags").value = result.account.profile.preferred_topics.join(", ");
   }
@@ -964,10 +1041,13 @@ function suggestedImagePrompt() {
 }
 
 async function generateNoteImage() {
-  if (!state.imageGenerator?.configured) {
+  if (activeToapisGenerationSource === "note-image" && $("#generateImageButton").textContent === "查询任务状态") {
+    await pollToapisGeneration(); return;
+  }
+  if (!state.toapis?.configured || !state.toapis?.image_model) {
     navigate("settings");
-    toast("先在服务设置中连接生图模型", true);
-    $("#imageApiKey").focus();
+    toast("先连接 ToAPIs 并选择笔记配图模型", true);
+    $("#toapisApiKey").focus();
     return;
   }
   if (!$("#postTitle").value.trim() || !$("#postBody").value.trim()) {
@@ -979,21 +1059,33 @@ async function generateNoteImage() {
   $("#imagePrompt").value = prompt;
   const button = $("#generateImageButton");
   button.disabled = true; button.textContent = "正在生成配图…";
-  $("#imageState").textContent = "正在调用生图接口，完成后图片会保存在本机。";
+  $("#imageState").textContent = `正在通过 ToAPIs ${state.toapis.image_model} 提交生成任务…`;
+  $("#imageState").className = "settings-result pending";
+  const clientRequestId = `toapis-${Math.floor(Date.now() / 1000)}-${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`;
+  activeToapisGeneration = clientRequestId;
+  activeToapisGenerationSource = "note-image";
   try {
-    const image = await api("/api/images/generate", jsonPost({ prompt, size: $("#imageSize").value }));
-    const canSelect = selectedImageIds.length < 9;
-    if (canSelect) selectedImageIds = [...selectedImageIds, image.id];
-    renderGeneratedImages([image, ...state.generatedImages]);
-    $("#imageState").textContent = canSelect
-      ? "配图已生成并加入当前笔记；你可以继续生成或移除图片。"
-      : "配图已保存到本机，但当前笔记已选满 9 张；移除一张图片后再加入。";
-    toast(canSelect ? "配图已生成并加入笔记" : "配图已保存；笔记最多选择 9 张", !canSelect);
+    const record = await api("/api/note-images/generate", jsonPost({
+      prompt, aspect_ratio: $("#imageSize").value, client_request_id: clientRequestId,
+    }));
+    showToapisGeneration(record, "note-image");
+    if (record.state === "unknown") toast("任务结果暂时无法确认，请查询状态，不要重新提交", true);
   } catch (error) {
-    $("#imageState").textContent = error.message;
-    toast(error.message, true);
+    if (error.status === 400 || error.status === 409) {
+      activeToapisGeneration = "";
+      $("#imageState").textContent = error.message;
+      $("#imageState").className = "settings-result error";
+      button.disabled = false;
+      button.textContent = "生成配图";
+      toast(error.message, true);
+    } else {
+      $("#imageState").textContent = `${error.message}\n请求结果尚未确认；可查询任务状态，不要重新提交。`;
+      $("#imageState").className = "settings-result pending";
+      button.disabled = false;
+      button.textContent = "查询任务状态";
+      toast("请求结果尚未确认，请查询任务状态", true);
+    }
   } finally {
-    button.textContent = "生成配图";
     updatePreview();
   }
 }
@@ -1159,12 +1251,13 @@ $("#toapisLoadModelsButton").addEventListener("click", loadToapisModels);
 $("#toapisLoadDocsButton").addEventListener("click", loadToapisDocs);
 $("#toapisGenerateButton").addEventListener("click", submitToapisGeneration);
 $("#toapisRetryDownloadButton").addEventListener("click", retryToapisDownload);
-$("#toapisMediaType").addEventListener("change", () => {
-  $("#toapisModelDocs").textContent = "生成类型已切换；请按当前模型 ID 重新读取参数说明。";
-  $("#toapisParams").value = "";
-  $("#toapisParams").dataset.documented = "";
+$("#toapisImageModel").addEventListener("change", () => {
+  $("#saveToapisImageModelButton").disabled = !$("#toapisImageModel").value
+    || $("#toapisImageModel").value === (state.toapis?.image_model || "");
 });
-$("#saveImageSettingsButton").addEventListener("click", () => saveImageGeneratorSettings(true).catch((error) => toast(error.message, true)));
+$("#loadToapisImageModelsButton").addEventListener("click", loadToapisImageModels);
+$("#saveToapisImageModelButton").addEventListener("click", saveToapisImageModel);
+$("#retryNoteImageDownloadButton").addEventListener("click", retryToapisDownload);
 $("#refreshButton").addEventListener("click", () => {
   if (currentPage === "monitor") refreshMonitor(true);
   else if (currentPage === "records") refreshJobs();

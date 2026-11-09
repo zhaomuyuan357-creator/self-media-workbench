@@ -15,13 +15,12 @@ from urllib.parse import unquote, urlparse
 
 from workbench.publishers import PublisherError, publisher_for, validate_local_mcp_endpoint
 from workbench.generators import GeneratorError, generate_with_profiles, validate_base_url
-from workbench.images import ImageGeneratorError, OpenAICompatibleImageGenerator
 from workbench.store import DuplicatePublishError, Repository
 from workbench.trends import TrendSourceError, agent_reach_status, scan_hotspots
 from workbench.toapis import (
     REGION_ENDPOINTS, ToAPIsError, ToAPIsMCPClient, documented_parameter_names,
-    download_result, endpoint_for_region, generation_fields, model_count, tool_text,
-    validate_params_against_docs,
+    download_result, endpoint_for_region, generation_fields, model_count, model_options,
+    note_image_params, tool_text, validate_params_against_docs,
 )
 
 
@@ -108,13 +107,9 @@ def _load_generator_profiles(settings):
 
 GENERATOR_PROFILES_RUNTIME = _load_generator_profiles(_saved_settings)
 GENERATOR_AUTO_FALLBACK = str(_saved_settings.get("generator_auto_fallback", "1")).lower() not in {"0", "false", "off"}
-IMAGE_RUNTIME = {
-    "base_url": _saved_settings.get("image_base_url") or os.environ.get("XHS_IMAGE_BASE_URL", "https://api.openai.com/v1"),
-    "model": _saved_settings.get("image_model") or os.environ.get("XHS_IMAGE_MODEL", "gpt-image-1"),
-    "api_key": os.environ.get("XHS_IMAGE_API_KEY", ""),
-}
 TOAPIS_RUNTIME = {
     "region": _saved_settings.get("toapis_region", "com"),
+    "image_model": _saved_settings.get("toapis_image_model", ""),
     "api_key": os.environ.get("TOAPIS_API_KEY", ""),
 }
 
@@ -227,21 +222,13 @@ def save_generator_profiles(value):
     return generator_public_settings()
 
 
-def image_public_settings():
-    return {
-        "base_url": IMAGE_RUNTIME["base_url"],
-        "model": IMAGE_RUNTIME["model"],
-        "configured": bool(IMAGE_RUNTIME["model"] and IMAGE_RUNTIME["api_key"]),
-        "key_in_memory": bool(IMAGE_RUNTIME["api_key"]),
-    }
-
-
 def toapis_public_settings():
     region = TOAPIS_RUNTIME["region"] if TOAPIS_RUNTIME["region"] in REGION_ENDPOINTS else "com"
     return {
         "region": region,
         "endpoint": REGION_ENDPOINTS[region],
         "configured": bool(TOAPIS_RUNTIME["api_key"]),
+        "image_model": TOAPIS_RUNTIME["image_model"],
     }
 
 
@@ -310,6 +297,60 @@ def _finish_toapis_generation(client_request_id, result):
             fields["task_id"] or record["task_id"], fields["poll_after_seconds"],
             error_text="生成已完成，但保存结果失败：{}；请勿重新提交生成任务。".format(str(exc)[:300]),
         )
+
+
+def start_toapis_generation(media_type, model, params, client_request_id, params_factory=None):
+    created, existing = DATA.create_toapis_generation(client_request_id, media_type, model)
+    if not created:
+        return existing
+    client = None
+    try:
+        client = toapis_client()
+        listed = client.list_models(media_type)
+        available = model_options(listed)
+        model_listing = tool_text(listed)
+        if ((available and not any(item["id"] == model for item in available))
+                or (not available and model not in model_listing)):
+            DATA.save_toapis_generation(
+                client_request_id, media_type, model, "failed",
+                error_text="所选模型未在当前 ToAPIs Key 的模型列表中；请先刷新列表并确认模型 ID。",
+            )
+            raise ValueError("当前 ToAPIs Key 的模型列表中没有该模型；请刷新模型列表确认模型 ID")
+        docs = client.get_model_docs(model)
+        if params_factory:
+            params = params_factory(docs)
+        validate_params_against_docs(params, docs)
+        try:
+            generated = client.generate(media_type, model, params, client_request_id)
+        except ToAPIsError as exc:
+            if exc.uncertain:
+                return DATA.save_toapis_generation(
+                    client_request_id, media_type, model, "unknown",
+                    error_text="请求结果暂时无法确认。请查询这个任务状态，不要重新提交。",
+                )
+            DATA.save_toapis_generation(client_request_id, media_type, model, "failed", error_text=str(exc))
+            raise
+    except (ToAPIsError, ValueError) as exc:
+        current = DATA.get_toapis_generation(client_request_id)
+        if current and current["state"] == "starting":
+            DATA.save_toapis_generation(
+                client_request_id, media_type, model, "failed", error_text=str(exc),
+            )
+        raise
+    finally:
+        if client:
+            client.close()
+
+    fields = generation_fields(generated)
+    DATA.save_toapis_generation(
+        client_request_id, media_type, model, fields["state"], fields["task_id"],
+        fields["poll_after_seconds"], error_text=fields["error"],
+    )
+    if fields["state"] == "completed":
+        record = _finish_toapis_generation(client_request_id, generated)
+    else:
+        record = DATA.get_toapis_generation(client_request_id)
+    return record
 
 
 def run_publish(job_id, request, idempotency_key, publisher):
@@ -414,7 +455,6 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 "settings": DATA.get_settings(),
                 "monitor": DATA.get_monitor_history(20),
                 "generator": generator_public_settings(),
-                "image_generator": image_public_settings(),
                 "toapis": toapis_public_settings(),
                 "toapis_generations": [
                     _copy_toapis_generation_for_response(item)
@@ -425,8 +465,6 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             self._json(200, {"history": DATA.get_monitor_history(30)})
         elif path == "/api/generator/settings":
             self._json(200, generator_public_settings())
-        elif path == "/api/image-generator/settings":
-            self._json(200, image_public_settings())
         elif path == "/api/toapis/settings":
             self._json(200, toapis_public_settings())
         elif path == "/api/toapis/models":
@@ -435,7 +473,12 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 with toapis_client() as client:
                     value = client.list_models(media_type)
                     count = model_count(value)
-                    return {"models": tool_text(value), "model_count": count, "has_models": count > 0}
+                    return {
+                        "models": tool_text(value),
+                        "model_options": model_options(value),
+                        "model_count": count,
+                        "has_models": count > 0,
+                    }
             self._toapis_json(read_models)
         elif path == "/api/toapis/balance":
             def read_balance():
@@ -453,6 +496,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                             model_results[media_type] = {
                                 "ok": True,
                                 "value": tool_text(value),
+                                "model_options": model_options(value),
                                 "count": model_count(value),
                             }
                         except (ToAPIsError, ValueError) as exc:
@@ -564,33 +608,22 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                         "clear_api_key": value.get("clear_api_key") is True,
                     }
                 self._json(200, save_generator_profiles(value))
-            elif path == "/api/image-generator/settings":
-                value = self._read_json()
-                base_url = validate_base_url(value.get("base_url") or "https://api.openai.com/v1")
-                model = str(value.get("model") or "").strip()[:120]
-                api_key = str(value.get("api_key") or "").strip()[:2000]
-                if not model:
-                    raise ValueError("请填写生图模型名称")
-                IMAGE_RUNTIME["base_url"] = base_url
-                IMAGE_RUNTIME["model"] = model
-                if value.get("clear_api_key") is True:
-                    IMAGE_RUNTIME["api_key"] = ""
-                elif api_key:
-                    IMAGE_RUNTIME["api_key"] = api_key
-                DATA.save_settings({"image_base_url": base_url, "image_model": model})
-                self._json(200, image_public_settings())
             elif path == "/api/toapis/settings":
                 value = self._read_json()
                 region = str(value.get("region") or "com").strip()
                 endpoint_for_region(region)
                 old_region = TOAPIS_RUNTIME["region"]
                 api_key = str(value.get("api_key") or "").strip()[:2000]
+                image_model = "" if region != old_region else str(
+                    value.get("image_model", TOAPIS_RUNTIME["image_model"]) or ""
+                ).strip()[:160]
                 if value.get("clear_api_key") is True or (region != old_region and not api_key):
                     TOAPIS_RUNTIME["api_key"] = ""
                 elif api_key:
                     TOAPIS_RUNTIME["api_key"] = api_key
                 TOAPIS_RUNTIME["region"] = region
-                DATA.save_settings({"toapis_region": region})
+                TOAPIS_RUNTIME["image_model"] = image_model
+                DATA.save_settings({"toapis_region": region, "toapis_image_model": image_model})
                 self._json(200, toapis_public_settings())
             elif path == "/api/toapis/models/docs":
                 value = self._read_json()
@@ -645,53 +678,29 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 client_request_id = str(value.get("client_request_id") or "").strip()
                 if not re.fullmatch(r"toapis-[A-Za-z0-9-]{10,96}", client_request_id):
                     raise ValueError("生成任务编号无效，请重新提交")
-                created, existing = DATA.create_toapis_generation(client_request_id, media_type, model)
-                if not created:
-                    self._json(202, _copy_toapis_generation_for_response(existing))
+                record = start_toapis_generation(media_type, model, params, client_request_id)
+                self._json(202, _copy_toapis_generation_for_response(record))
+            elif path == "/api/note-images/generate":
+                value = self._read_json()
+                account = DATA.get_account()
+                if not account["configured"]:
+                    self._error(409, "请先完成账号定位再生成笔记配图")
                     return
-                client = None
-                try:
-                    client = toapis_client()
-                    model_list = tool_text(client.list_models(media_type))
-                    if model not in model_list:
-                        DATA.save_toapis_generation(
-                            client_request_id, media_type, model, "failed",
-                            error_text="所选模型未在当前 ToAPIs Key 的模型列表中；请先刷新列表并确认模型 ID。",
-                        )
-                        raise ValueError("当前 ToAPIs Key 的模型列表中没有该模型；请刷新模型列表确认模型 ID")
-                    docs = client.get_model_docs(model)
-                    validate_params_against_docs(params, docs)
-                    try:
-                        generated = client.generate(media_type, model, params, client_request_id)
-                    except ToAPIsError as exc:
-                        if exc.uncertain:
-                            record = DATA.save_toapis_generation(
-                                client_request_id, media_type, model, "unknown",
-                                error_text="请求结果暂时无法确认。请查询这个任务状态，不要重新提交。",
-                            )
-                            self._json(202, record)
-                            return
-                        DATA.save_toapis_generation(client_request_id, media_type, model, "failed", error_text=str(exc))
-                        raise
-                except (ToAPIsError, ValueError) as exc:
-                    current = DATA.get_toapis_generation(client_request_id)
-                    if current and current["state"] == "starting":
-                        DATA.save_toapis_generation(
-                            client_request_id, media_type, model, "failed", error_text=str(exc),
-                        )
-                    raise
-                finally:
-                    if client:
-                        client.close()
-                fields = generation_fields(generated)
-                DATA.save_toapis_generation(
-                    client_request_id, media_type, model, fields["state"], fields["task_id"],
-                    fields["poll_after_seconds"], error_text=fields["error"],
+                model = TOAPIS_RUNTIME["image_model"]
+                if not TOAPIS_RUNTIME["api_key"] or not model:
+                    self._error(409, "请先在服务设置中连接 ToAPIs 并选择笔记配图模型")
+                    return
+                prompt = str(value.get("prompt") or "").strip()[:4000]
+                aspect_ratio = str(value.get("aspect_ratio") or "2:3").strip()
+                if aspect_ratio not in {"2:3", "1:1", "3:2"}:
+                    raise ValueError("图片比例无效")
+                client_request_id = str(value.get("client_request_id") or "").strip()
+                if not re.fullmatch(r"toapis-[A-Za-z0-9-]{10,96}", client_request_id):
+                    raise ValueError("生成任务编号无效，请重新提交")
+                record = start_toapis_generation(
+                    "image", model, None, client_request_id,
+                    params_factory=lambda docs: note_image_params(prompt, aspect_ratio, docs),
                 )
-                if fields["state"] == "completed":
-                    record = _finish_toapis_generation(client_request_id, generated)
-                else:
-                    record = DATA.get_toapis_generation(client_request_id)
                 self._json(202, _copy_toapis_generation_for_response(record))
             elif path == "/api/generator/test":
                 value = self._read_json()
@@ -759,19 +768,6 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                     "fallback_used": result["fallback_used"],
                     "fallback_reason": result["fallback_reason"],
                 })
-            elif path == "/api/images/generate":
-                value = self._read_json()
-                account = DATA.get_account()
-                if not account["configured"]:
-                    self._error(409, "请先完成账号定位再生成笔记配图")
-                    return
-                generator = OpenAICompatibleImageGenerator(
-                    IMAGE_RUNTIME["base_url"], IMAGE_RUNTIME["model"], IMAGE_RUNTIME["api_key"],
-                )
-                image_bytes, mime_type = generator.generate(value.get("prompt", ""), value.get("size", "1024x1024"))
-                asset = DATA.save_generated_image(image_bytes, mime_type)
-                asset.pop("path", None); asset.pop("extension", None)
-                self._json(201, asset)
             elif path == "/api/publish":
                 self._start_publish()
             elif path.startswith("/api/jobs/") and path.endswith("/verification"):
@@ -784,8 +780,6 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         except DuplicatePublishError as exc:
             self._error(409, "相同内容已有发布任务，请先核对已有任务，避免重复发布。", job_id=exc.job_id)
         except GeneratorError as exc:
-            self._error(502, str(exc))
-        except ImageGeneratorError as exc:
             self._error(502, str(exc))
         except ToAPIsError as exc:
             self._error(502, str(exc))

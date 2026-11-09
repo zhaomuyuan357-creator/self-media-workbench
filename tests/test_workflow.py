@@ -161,14 +161,22 @@ class WorkflowHTTPTests(unittest.TestCase):
 
     def test_toapis_settings_keep_key_only_in_process_memory(self):
         status, settings = self.request("/api/toapis/settings", {
-            "region": "com", "api_key": "test-only-toapis-key",
+            "region": "com", "image_model": "gpt-image-2", "api_key": "test-only-toapis-key",
         })
         self.assertEqual(status, 200)
         self.assertTrue(settings["configured"])
+        self.assertEqual(settings["image_model"], "gpt-image-2")
         self.assertNotIn("api_key", settings)
         status, bootstrap = self.request("/api/bootstrap")
         self.assertEqual(status, 200)
+        self.assertEqual(bootstrap["toapis"]["image_model"], "gpt-image-2")
         self.assertNotIn("test-only-toapis-key", json.dumps(bootstrap))
+        self.assertNotIn("image_generator", bootstrap)
+        status, switched = self.request("/api/toapis/settings", {"region": "cn"})
+        self.assertEqual(status, 200)
+        self.assertEqual(switched["region"], "cn")
+        self.assertFalse(switched["configured"])
+        self.assertEqual(switched["image_model"], "")
 
     def test_toapis_bootstrap_does_not_expose_local_asset_paths(self):
         repo = Repository(self.data_dir)

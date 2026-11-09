@@ -21,7 +21,6 @@ flowchart LR
   TREND --> AIHOT[AIHOT GET]
   TREND --> REACH[Agent-Reach CLI]
   API --> TEXT[文案生成器]
-  API --> IMAGE[生图生成器]
   API --> TOAPIS[ToAPIs MCP 媒体适配器]
   TOAPIS --> REMOTE[ToAPIs 图片/视频异步任务]
   REMOTE -->|状态与结果| TOAPIS
@@ -29,7 +28,7 @@ flowchart LR
   TOAPIS --> TGEN[ToAPIs 任务记录]
   TGEN --> DB
   TEXT --> CP[ContentPackage]
-  IMAGE --> ASSET[本机图片素材]
+  TOAPIS --> ASSET[本机图片与视频素材]
   CP --> DB[(SQLite)]
   ASSET --> DB
   ASSET --> FS[(data/media)]
@@ -75,9 +74,9 @@ flowchart LR
 
 `workbench/generators.py` 的生成器适配 OpenAI 兼容 Chat Completions 和 Responses API，路由器按用户配置的方案顺序选用模型。方案元数据和顺序保存在应用设置；最多 8 套方案，每套的 API Key 只放在当前进程内存。DeepSeek、通义千问、OpenAI、AixHan 提供接口地址预设，自定义方案可指定兼容地址与协议。每次生成默认先调用列表首位；开启自动切换后，仅在 HTTP 429 限流时依次尝试后续已配置 Key 的方案。其他服务错误、连接中断、超时或响应格式异常不会重发，避免结果不确定时重复计费。单方案测试会关闭备用路由。生成器不核实事实，不操作发布器；请求不跟随 HTTP 重定向，避免向其他地址转发 API Key。
 
-### 生图生成器和素材
+### 笔记配图和素材
 
-`workbench/images.py` 调用 OpenAI 兼容 `images/generations` 接口并要求 `b64_json` 响应；不下载远程图片 URL，也不跟随重定向。图片经过 MIME/文件签名检查后写入 `data/media`，素材元数据进入 SQLite。界面允许选择最多 9 张图用于笔记。
+笔记配图通过 ToAPIs MCP 的图片模型生成，不配置第二套图片 API Key。服务设置从当前 ToAPIs Key 读取可用图片模型，保存默认模型 ID；内容制作页按模型文档构建提示词和受支持的比例参数，提交异步任务后复用 ToAPIs 任务记录、状态轮询和安全下载流程。用户完成后可将图片自动加入笔记，最多选择 9 张。旧版 `image_base_url` 和 `image_model` 设置保留在本地数据库，但新流程不会读取它们。
 
 ### ToAPIs 媒体生成
 
@@ -157,7 +156,7 @@ Publisher.read_account_snapshot() -> MonitorSnapshot
 
 - 本地 HTTP 服务绑定 `127.0.0.1`；写请求只接受本机来源。
 - SQLite、媒体文件均留在配置的数据目录。
-- 文案、生图和 ToAPIs Key 仅在运行期间存在于内存；文案和生图模型请求禁止跟随重定向。
+- 文案和 ToAPIs Key 仅在运行期间存在于内存；文案模型请求禁止跟随重定向。
 - ToAPIs Key 仅在运行期间存在于内存；媒体下载固定到已验证公网 IP，并检查每个重定向目标。
 - AIHOT 适配器仅向 AIHOT 域名发 GET；Agent-Reach 仅用于只读搜索。
 - 不绕过登录、安全校验、验证码、访问限制或平台风控。

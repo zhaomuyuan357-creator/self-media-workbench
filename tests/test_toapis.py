@@ -2,11 +2,14 @@ import json
 import unittest
 from unittest.mock import patch
 import socket
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
 
 from workbench.toapis import (
     ToAPIsMCPClient, ToAPIsError, _parse_response, _public_https_url,
-    documented_parameter_names, generation_fields, model_count, tool_text,
-    validate_params_against_docs,
+    documented_parameter_names, generation_fields, model_count, model_options,
+    note_image_params, tool_text, validate_params_against_docs,
 )
 
 
@@ -123,6 +126,89 @@ class ToAPIsTests(unittest.TestCase):
             validate_params_against_docs({"unexpected": True}, docs)
         self.assertEqual(model_count({"models": []}), 0)
         self.assertEqual(model_count({"models": [{"id": "one"}]}), 1)
+
+    def test_image_models_are_normalized_for_selection(self):
+        options = model_options({"models": [
+            {"id": "gpt-image-2", "name": "Image 2"},
+            {"model_id": "image-fast", "display_name": "Fast image"},
+            {"id": "gpt-image-2", "name": "duplicate"},
+        ]})
+        self.assertEqual(options, [
+            {"id": "gpt-image-2", "label": "Image 2"},
+            {"id": "image-fast", "label": "Fast image"},
+        ])
+        self.assertEqual(model_options(
+            "| Model ID | Name |\n|---|---|\n| image2 | Image 2 |\n| image-fast | Fast |"
+        ), [
+            {"id": "image2", "label": "Image 2"},
+            {"id": "image-fast", "label": "Fast"},
+        ])
+
+    def test_note_image_parameters_follow_model_documentation(self):
+        docs = (
+            "| Parameter | Required | Type |\n|---|---|---|\n"
+            "| prompt | yes | string |\n| aspect_ratio | no | enum |\n"
+            "| size | no | string |\n允许比例：2:3、1:1、3:2"
+        )
+        self.assertEqual(note_image_params("A cover", "1:1", docs), {
+            "prompt": "A cover", "aspect_ratio": "1:1",
+        })
+        with self.assertRaisesRegex(ValueError, "没有 prompt 字段"):
+            note_image_params("A cover", "2:3", "| Parameter | Required |\n|---|---|\n| seed | no |")
+
+    def test_note_image_generation_uses_selected_toapis_model_and_documented_params(self):
+        import app as workbench_app
+        from workbench.store import Repository
+
+        docs = (
+            "| Parameter | Required | Type |\n|---|---|---|\n"
+            "| prompt | yes | string |\n| aspect_ratio | no | enum |\n"
+            "可选比例：2:3、1:1、3:2"
+        )
+
+        class FakeClient:
+            def __init__(self):
+                self.arguments = None
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def close(self):
+                return None
+
+            def list_models(self, media_type):
+                self.asserted_media_type = media_type
+                return {"models": [{"id": "image2", "name": "Image 2"}]}
+
+            def get_model_docs(self, model):
+                self.asserted_model = model
+                return docs
+
+            def generate(self, media_type, model, params, request_id):
+                self.arguments = (media_type, model, params, request_id)
+                return {"state": "running", "task_id": "task-image", "poll_after_seconds": 2}
+
+        client = FakeClient()
+        with tempfile.TemporaryDirectory(prefix="toapis-note-image-") as temp:
+            repository = Repository(Path(temp) / "data")
+            with patch.object(workbench_app, "DATA", repository), \
+                    patch.object(workbench_app, "toapis_client", return_value=client):
+                record = workbench_app.start_toapis_generation(
+                    "image", "image2", None, "toapis-note-image-123456",
+                    params_factory=lambda model_docs: note_image_params("AI cover", "2:3", model_docs),
+                )
+
+        self.assertEqual(client.asserted_media_type, "image")
+        self.assertEqual(client.asserted_model, "image2")
+        self.assertEqual(client.arguments, (
+            "image", "image2", {"prompt": "AI cover", "aspect_ratio": "2:3"},
+            "toapis-note-image-123456",
+        ))
+        self.assertEqual(record["state"], "running")
+        self.assertEqual(record["task_id"], "task-image")
 
     def test_generation_states_and_private_result_hosts_are_checked(self):
         self.assertEqual(generation_fields({"status": "succeeded", "output": [{"url": "https://cdn.example/image.png"}]})["state"], "completed")

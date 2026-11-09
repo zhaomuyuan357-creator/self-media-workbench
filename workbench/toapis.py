@@ -3,6 +3,7 @@
 import json
 import http.client
 import ipaddress
+import re
 import socket
 import ssl
 import urllib.error
@@ -332,17 +333,80 @@ def tool_text(value):
 
 
 def model_count(value):
-    if isinstance(value, dict):
-        models = value.get("models")
-        return len(models) if isinstance(models, list) else 0
-    if isinstance(value, list):
-        return len(value)
+    return len(model_options(value))
+
+
+def model_options(value):
+    """Return stable model IDs and display labels from common list shapes."""
     if isinstance(value, str):
         try:
-            return model_count(json.loads(value))
+            return model_options(json.loads(value))
         except ValueError:
-            return 0
-    return 0
+            lines = [line.strip() for line in value.splitlines() if line.strip()]
+            header = None
+            options = []
+            seen = set()
+            for line in lines:
+                if not line.startswith("|"):
+                    continue
+                columns = [cell.strip().strip("`* ") for cell in line.strip("|").split("|")]
+                if all(set(cell) <= {"-", ":", " "} for cell in columns if cell):
+                    continue
+                normalized = [cell.lower().replace(" ", "_") for cell in columns]
+                id_index = next((index for index, name in enumerate(normalized)
+                                 if name in {"id", "model", "model_id", "model_name", "模型", "模型id", "模型名称"}), None)
+                if id_index is not None:
+                    header = (id_index, next((index for index, name in enumerate(normalized)
+                                              if name in {"name", "display_name", "名称", "显示名称"}), id_index))
+                    continue
+                if header and max(header) < len(columns):
+                    model_id = columns[header[0]]
+                    label = columns[header[1]] or model_id
+                    if model_id and model_id.lower() not in {"id", "model", "模型"} and model_id not in seen:
+                        seen.add(model_id)
+                        options.append({"id": model_id[:160], "label": label[:200]})
+            if options:
+                return options
+            for line in lines:
+                candidate = re.sub(r"^[\s>*-]+", "", line)
+                candidate = re.sub(r"^(?:model(?:_id)?|模型(?:id|名称)?)\s*[:：]\s*", "", candidate, flags=re.I)
+                if (re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{1,159}", candidate)
+                        and candidate.lower() not in {"models", "available", "model", "image", "video"}
+                        and candidate not in seen):
+                    seen.add(candidate)
+                    options.append({"id": candidate, "label": candidate})
+            return options
+    if isinstance(value, dict):
+        for key in ("models", "data", "items", "results"):
+            items = value.get(key)
+            if isinstance(items, (dict, list)):
+                return model_options(items)
+        for key in ("text", "markdown"):
+            if isinstance(value.get(key), str):
+                parsed = model_options(value[key])
+                if parsed:
+                    return parsed
+        return []
+    if not isinstance(value, list):
+        return []
+    options = []
+    seen = set()
+    for item in value:
+        if isinstance(item, str):
+            model_id = item.strip()
+            label = model_id
+        elif isinstance(item, dict):
+            model_id = next((str(item.get(key) or "").strip()
+                             for key in ("id", "model_id", "model", "name", "slug")
+                             if item.get(key)), "")
+            label = str(item.get("name") or item.get("display_name") or model_id).strip()
+        else:
+            continue
+        if not model_id or model_id in seen:
+            continue
+        seen.add(model_id)
+        options.append({"id": model_id[:160], "label": label[:200]})
+    return options
 
 
 def documented_parameter_names(docs):
@@ -376,6 +440,32 @@ def validate_params_against_docs(params, docs):
     unknown = [str(name) for name in params if str(name).lower() not in allowed]
     if unknown:
         raise ValueError("参数说明中没有找到这些字段：{}".format("、".join(unknown[:8])))
+    return params
+
+
+def note_image_params(prompt, aspect_ratio, docs):
+    """Build only parameters named by the selected model's documentation."""
+    text = docs if isinstance(docs, str) else tool_text(docs)
+    names = documented_parameter_names(docs)
+    by_normalized_name = {name.lower().replace("_", "").replace("-", ""): name for name in names}
+    prompt_name = by_normalized_name.get("prompt")
+    if not prompt_name:
+        raise ValueError("所选 ToAPIs 图片模型参数说明中没有 prompt 字段")
+    params = {prompt_name: str(prompt or "").strip()[:4000]}
+    if not params[prompt_name]:
+        raise ValueError("请填写配图描述")
+
+    ratio_values = {"2:3": "1024x1536", "1:1": "1024x1024", "3:2": "1536x1024"}
+    aspect_name = next((by_normalized_name.get(candidate) for candidate in
+                        ("aspectratio", "imageratio", "ratio") if by_normalized_name.get(candidate)), None)
+    size_name = next((by_normalized_name.get(candidate) for candidate in
+                      ("size", "imagesize") if by_normalized_name.get(candidate)), None)
+    if aspect_name and re.search(r"(?<![0-9]){}(?![0-9])".format(re.escape(aspect_ratio)), text):
+        params[aspect_name] = aspect_ratio
+    elif size_name:
+        size_value = ratio_values.get(aspect_ratio, ratio_values["2:3"])
+        if size_value.lower() in text.lower():
+            params[size_name] = size_value
     return params
 
 
