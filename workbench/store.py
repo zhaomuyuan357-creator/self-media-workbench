@@ -8,6 +8,9 @@ from pathlib import Path
 
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".avi"}
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
+IMAGE_UPLOAD_LIMIT = 32 * 1024 * 1024
+VIDEO_UPLOAD_LIMIT = 300 * 1024 * 1024
 
 
 def now_iso():
@@ -36,9 +39,10 @@ class Repository:
         self._initialize()
 
     def _connect(self):
-        conn = sqlite3.connect(str(self.db_path), timeout=15)
+        conn = sqlite3.connect(str(self.db_path), timeout=5)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA busy_timeout = 5000")
         conn.execute("PRAGMA journal_mode = WAL")
         return conn
 
@@ -271,8 +275,10 @@ class Repository:
     def save_asset(self, original_name, file_obj, mime_type):
         original_name = Path(original_name or "video").name.replace("\x00", "")[:240]
         extension = Path(original_name).suffix.lower()
-        if extension not in VIDEO_EXTENSIONS:
-            raise ValueError("首版支持 MP4、MOV、M4V、WebM 或 AVI 视频")
+        if extension not in VIDEO_EXTENSIONS | IMAGE_EXTENSIONS:
+            raise ValueError("支持 PNG、JPEG、WebP 图片或 MP4、MOV、M4V、WebM、AVI 视频")
+        media_type = "image" if extension in IMAGE_EXTENSIONS else "video"
+        limit = IMAGE_UPLOAD_LIMIT if media_type == "image" else VIDEO_UPLOAD_LIMIT
         asset_id = uuid.uuid4().hex
         stored_name = asset_id + extension
         target = self.media_dir / stored_name
@@ -285,12 +291,24 @@ class Repository:
                     if not chunk:
                         break
                     size += len(chunk)
-                    if size > 1024 * 1024 * 1024:
-                        raise ValueError("单个视频不能超过 1 GB")
+                    if size > limit:
+                        limit_label = "32 MB" if media_type == "image" else "300 MB"
+                        raise ValueError("单个{}不能超过 {}".format("图片" if media_type == "image" else "视频", limit_label))
                     digest.update(chunk)
                     out.write(chunk)
             if size == 0:
-                raise ValueError("视频文件为空")
+                raise ValueError("文件为空")
+            if media_type == "image":
+                with target.open("rb") as source:
+                    header = source.read(12)
+                signatures = {
+                    ".png": header.startswith(b"\x89PNG\r\n\x1a\n"),
+                    ".jpg": header.startswith(b"\xff\xd8\xff"),
+                    ".jpeg": header.startswith(b"\xff\xd8\xff"),
+                    ".webp": len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"WEBP",
+                }
+                if not signatures[extension]:
+                    raise ValueError("图片扩展名与文件内容不匹配")
         except Exception:
             try:
                 target.unlink()
@@ -303,7 +321,7 @@ class Repository:
                 "INSERT INTO assets(id,original_name,stored_name,extension,mime_type,size_bytes,sha256,media_type,created_at) "
                 "VALUES(?,?,?,?,?,?,?,?,?)",
                 (asset_id, original_name, stored_name, extension,
-                 (mime_type or "application/octet-stream")[:100], size, digest.hexdigest(), "video", stamp),
+                 (mime_type or "application/octet-stream")[:100], size, digest.hexdigest(), media_type, stamp),
             )
         return self.get_asset(asset_id)
 

@@ -28,7 +28,7 @@ AIHOT 服务条款允许个人非商业、公益非商业和组织内部使用�
 
 ## 启动
 
-需要 Python 3.9–3.12；工作台后端使用 Python 标准库，不需要安装第三方 Python 包。Python 3.13 暂不支持，因为其已移除本项目当前使用的 multipart 标准库模块。
+需要 Python 3.9 或更新版本；工作台后端仅使用 Python 标准库，不需要安装第三方 Python 包。上传解析器按 64 KB 分块读取 multipart 请求，并将文件暂存到内存阈值为 1 MB 的临时文件；图片最大 32 MB，视频最大 300 MB。支持 PNG、JPEG、WebP 图片和 MP4、MOV、M4V、WebM、AVI 视频，图片上传会校验文件签名。
 
 ```bash
 python3 app.py
@@ -77,13 +77,20 @@ python3 -m unittest discover -s tests -v
 ## 代码结构
 
 ```text
-app.py                  本机 HTTP 服务与工作流 API
+app.py                  向后兼容的启动器；执行 python3 app.py 启动 HTTP 服务
+workbench/http_api.py   本机 HTTP 路由、请求/响应与静态资源服务
+workbench/runtime.py    线程安全的进程内模型配置与密钥管理
+workbench/services.py   发布队列、核验等应用服务门面
+workbench/multipart.py  固定分块、磁盘暂存的 multipart 上传解析
 workbench/store.py      SQLite 数据、图片素材、内容任务和监测快照
 workbench/trends.py     AIHOT 与 Agent-Reach 只读热点适配器
 workbench/generators.py OpenAI 兼容 Chat Completions / Responses 文案生成器
 workbench/toapis.py     ToAPIs MCP 接入和生成媒体下载
 workbench/publishers.py 模拟发布器与本机小红书 MCP 适配器
-web/                    五个独立页面和工作流界面
+web/app.js              原生 ES Module 应用入口
+web/core/               API、共享状态、轮询与 DOM 工具
+web/views/              页面生命周期模块（mount/unmount）
+web/                    页面结构、样式与模块化界面
 data/                   本地数据库、图片和运行数据
 docs/PRD.md             产品范围和验收标准
 docs/ARCHITECTURE.md    模块边界和扩展方式

@@ -76,6 +76,20 @@ class RepositoryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "格式与生图接口声明不符"):
             self.repo.save_generated_image(b"not-an-image", "image/png")
 
+    def test_uploaded_image_is_sniffed_and_saved_with_image_media_type(self):
+        image = self.repo.save_asset(
+            "cover.png", _BytesReader(b"\x89PNG\r\n\x1a\nfixture"), "application/octet-stream",
+        )
+        self.assertEqual(image["media_type"], "image")
+        self.assertEqual(image["extension"], ".png")
+        with self.assertRaisesRegex(ValueError, "扩展名与文件内容不匹配"):
+            self.repo.save_asset("fake.jpg", _BytesReader(b"not-an-image"), "image/jpeg")
+
+    def test_sqlite_busy_timeout_is_configured(self):
+        with self.repo._connect() as db:
+            value = db.execute("PRAGMA busy_timeout").fetchone()[0]
+        self.assertEqual(value, 5000)
+
     def test_generated_video_is_validated_and_saved_as_video_asset(self):
         video = self.repo.save_generated_video(b"....ftypisom....video", "video/mp4")
         self.assertEqual(video["media_type"], "video")

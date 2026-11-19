@@ -81,6 +81,7 @@ class WorkflowHTTPTests(unittest.TestCase):
         self.assertNotIn("api_key", bootstrap["toapis"])
         status, connection_error = self.request("/api/toapis/models")
         self.assertEqual(status, 400)
+
         self.assertIn("API Key", connection_error["error"])
         old_version = bootstrap["account"]["current_profile_version"]
         profile_payload = {
@@ -149,6 +150,37 @@ class WorkflowHTTPTests(unittest.TestCase):
 
         status, _ = self.request("/api/jobs/{}/verification".format(job["id"]), {"outcome": "visible"})
         self.assertEqual(status, 400)
+
+    def test_native_module_assets_are_served_with_javascript_mime(self):
+        for path in ("/app.js", "/core/api.js", "/core/controller.js", "/views/account.js"):
+            req = urllib.request.Request(self.base + path)
+            with urllib.request.urlopen(req, timeout=5) as response:
+                self.assertEqual(response.status, 200)
+                self.assertIn("javascript", response.headers.get("Content-Type", ""))
+                self.assertTrue(response.read())
+
+        req = urllib.request.Request(self.base + "/core/../../app.py")
+        with self.assertRaises(urllib.error.HTTPError) as captured:
+            urllib.request.urlopen(req, timeout=5)
+        self.assertEqual(captured.exception.code, 404)
+
+    def test_upload_endpoint_accepts_validated_image_and_video(self):
+        boundary = "----workbench-upload-test"
+        for filename, mime, payload, media_type in (
+            ("cover.png", "image/png", b"\x89PNG\r\n\x1a\nfixture", "image"),
+            ("demo.mp4", "video/mp4", b"not-a-real-video-but-valid-test-payload", "video"),
+        ):
+            body = (
+                "--{}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{}\"\r\n"
+                "Content-Type: {}\r\n\r\n".format(boundary, filename, mime).encode("ascii")
+                + payload + "\r\n--{}--\r\n".format(boundary).encode("ascii")
+            )
+            status, asset = self.request(
+                "/api/assets", data=body,
+                content_type="multipart/form-data; boundary={}".format(boundary),
+            )
+            self.assertEqual(status, 201)
+            self.assertEqual(asset["media_type"], media_type)
 
     def test_publish_requires_explicit_confirmation(self):
         status, result = self.request("/api/publish", {

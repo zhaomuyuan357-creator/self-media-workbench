@@ -15,7 +15,11 @@
 
 ```mermaid
 flowchart LR
-  UI[本地工作台界面] --> API[app.py 工作流 API]
+  UI[本地工作台界面] --> API[workbench/http_api.py]
+  API --> SVC[workbench/services.py]
+  API --> RT[workbench/runtime.py]
+  API --> DB[(SQLite)]
+  SVC --> DB
   API --> PROF[账号定位版本]
   API --> TREND[热点适配器]
   TREND --> AIHOT[AIHOT GET]
@@ -29,7 +33,7 @@ flowchart LR
   TGEN --> DB
   TEXT --> CP[ContentPackage]
   TOAPIS --> ASSET[本机图片与视频素材]
-  CP --> DB[(SQLite)]
+  CP --> DB
   ASSET --> DB
   ASSET --> FS[(data/media)]
   API --> PUB[Publisher 接口]
@@ -53,7 +57,7 @@ flowchart LR
 
 ### 工作台界面与工作流 API
 
-`web/` 提供账号定位、内容制作、账号监测、发布记录、服务设置五个页面。`app.py` 校验输入、读取当前定位和设置、调用适配器并存储结果。界面不直接访问 MCP、模型 API 或数据库。
+`web/` 提供账号定位、内容制作、账号监测、发布记录、服务设置五个页面。`app.py` 保持 `python3 app.py` 启动入口及旧导入兼容；`workbench/http_api.py` 负责 HTTP 协议、路由和静态资源；`workbench/services.py` 当前承接发布队列和核验入口；`workbench/runtime.py` 保护进程内凭据及模型配置。界面不直接访问 MCP、模型 API 或数据库。
 
 ### 账号与定位
 
@@ -82,13 +86,13 @@ flowchart LR
 
 `workbench/toapis.py` 使用官方 Streamable HTTP MCP 工具读取模型、余额和参数说明，并提交图片/视频生成任务。工作台为每次生成创建唯一 `client_request_id`，保存任务编号、状态、模型和素材 ID；轮询与请求超时恢复使用同一编号，避免因浏览器断线重复提交。MCP session 在一次操作结束后尝试关闭。
 
-生成完成后，适配器只下载返回的 HTTPS 媒体链接。下载前检查 DNS 所有地址均为公网地址，并将实际 TLS 连接固定到已校验的 IP；仅允许标准 HTTPS 端口，重定向目标也会重新验证。下载限制图片 25 MB、视频 1 GB，并按 MIME 与文件签名验证格式。结果 URL 不保存到 SQLite。下载失败保留任务 ID，用户可重新查询并只重试下载，不会重提生成任务。图片结果进入现有图片列表，视频可在页面预览和下载；该功能不提供视频剪辑或独立发布流程。
+生成完成后，适配器只下载返回的 HTTPS 媒体链接。下载前检查 DNS 所有地址均为公网地址，并将实际 TLS 连接固定到已校验的 IP；仅允许标准 HTTPS 端口，重定向目标也会重新验证。下载限制图片 25 MB、视频 1 GB，并按 MIME 与文件签名验证格式。结果 URL 不保存到 SQLite。下载失败保留任务 ID，用户可重新查询并只重试下载，不会重提生成任务。图片结果进入现有图片列表，视频可在页面预览和下载；该功能不提供视频剪辑或独立发布流程。上传解析由 `workbench/multipart.py` 按 64 KB 分块读取并写入磁盘暂存文件；上传图片上限 32 MB、视频上限 300 MB，图片会核验文件签名。
 
 ### 内容包与存储
 
 `ContentPackage` 保存账号定位版本、内容类型、主素材 ID、多素材 ID 列表、标题、正文、话题、来源引用和内容指纹。图文笔记通过 `content_type=note` 与多个图片 `asset_ids` 表示；视频历史记录的默认类型和单素材兼容逻辑保留。
 
-SQLite 元数据和本机媒体文件分开保存。API Key 只放在运行时内存，不写入数据库。监测快照使用字段白名单，过滤 Cookie、Token 等敏感字段。
+SQLite 元数据和本机媒体文件分开保存。API Key 只放在运行时内存，不写入数据库。监测快照使用字段白名单，过滤 Cookie、Token 等敏感字段。SQLite 连接使用 WAL、外键约束和统一 5000 毫秒 `busy_timeout`。
 
 文案模型设置以 `generator_profiles_json` 保存不含密钥的方案数组，并单独记录 `generator_auto_fallback`。方案数组的顺序就是首选及备用顺序。保存配置时，只有当前编辑方案的新 Key 会更新该方案的运行时密钥；任何方案更换服务商或接口地址时都会清除旧 Key。旧版 `generator_model` 等单模型设置在启动时迁移为一套方案，且旧版环境变量 Key 绑定到这唯一的迁移方案；显式空数组表示用户已删除所有方案，不会恢复旧配置。新版多方案中，环境变量 Key 只应用于接口地址和模型 ID 均匹配的方案。
 
@@ -156,13 +160,30 @@ Publisher.read_account_snapshot() -> MonitorSnapshot
 
 - 本地 HTTP 服务绑定 `127.0.0.1`；写请求只接受本机来源。
 - SQLite、媒体文件均留在配置的数据目录。
+- SQLite 并发写等待上限为 5 秒。
 - 文案和 ToAPIs Key 仅在运行期间存在于内存；文案模型请求禁止跟随重定向。
 - ToAPIs Key 仅在运行期间存在于内存；媒体下载固定到已验证公网 IP，并检查每个重定向目标。
 - AIHOT 适配器仅向 AIHOT 域名发 GET；Agent-Reach 仅用于只读搜索。
 - 不绕过登录、安全校验、验证码、访问限制或平台风控。
 - AIHOT 面向外部商业用途需事先取得服务方书面授权；见 <https://aihot.news/terms>。
 
-## 7. 后续扩展顺序
+## 7. 代码模块
+
+```text
+app.py                              兼容启动器
+workbench/http_api.py               HTTP handler、API 路由和静态资源
+workbench/services.py               发布队列与核验服务门面
+workbench/runtime.py                线程安全内存配置与敏感值清洗
+workbench/multipart.py               有界分块上传解析
+workbench/store.py                  SQLite WAL 与本地素材持久化
+web/app.js                          原生 ES Module 入口
+web/core/{api,state,dom,poller}.js   前端基础设施
+web/views/*.js                      页面 mount/unmount 生命周期
+```
+
+服务端和前端都不增加第三方运行依赖。路由切页时卸载当前视图、移除页面事件处理器并停止轮询。当前前端已拆出公共能力和按页生命周期绑定；具体工作流处理函数暂留在 `web/core/controller.js`，后续可逐页迁入 `web/views/`。
+
+## 8. 后续扩展顺序
 
 1. 实机核验热点、文案、生图和图文发布链路，并记录各来源的真实可用状态。
 2. 增加来源缓存、去重和新鲜度提示，仍由用户主动触发或明确开启。
